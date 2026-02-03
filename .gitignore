@@ -1,0 +1,25 @@
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Rust ---
+/target/
+**/*.rs.bk
+
+# --- Python ---
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# --- App state / caches ---
+.mitsuba_studio_state.json
+.mitsuba_xml_gui_state.json
+
+# --- Outputs ---
+/cbox.png
+/renders/
+
+# --- Misc ---
+*.log

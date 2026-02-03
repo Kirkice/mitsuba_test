@@ -8,7 +8,7 @@ use egui::{ColorImage, TextureHandle};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 
-/// A pragmatic Mitsuba XML generator GUI.
+/// Mitsuba Studio: a pragmatic front-end for Mitsuba scene setup + rendering.
 ///
 /// Design goals:
 /// - Provide a friendlier workflow than hand-editing XML
@@ -24,14 +24,14 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 720.0])
-            .with_title("Mitsuba XML Config Tool"),
+            .with_title("Mitsuba Studio"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Mitsuba XML Config Tool",
+        "Mitsuba Studio",
         native_options,
-        Box::new(|cc| Ok(Box::new(MitsubaXmlApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(MitsubaStudioApp::new(cc)))),
     )
 }
 
@@ -184,18 +184,23 @@ impl Default for CornellBoxConfig {
                 kind: ObjectKind::Sphere,
                 sphere_radius: 0.35,
                 cube_scale: [0.5, 0.8, 0.5],
-                ply_filename: "../scenes/meshes/teapot.ply".to_string(),
-                obj_filename: "../scenes/meshes/teapot.obj".to_string(),
+                ply_filename: "meshes/teapot.ply".to_string(),
+                obj_filename: "meshes/teapot.obj".to_string(),
                 mesh_scale: 1.0,
             },
         }
     }
 }
 
-struct MitsubaXmlApp {
+struct MitsubaStudioApp {
     config: CornellBoxConfig,
     last_status: String,
     xml_preview: String,
+
+    // --- UI ---
+    sidebar_tab: SidebarTab,
+    main_tab: MainTab,
+    style_applied: bool,
 
     // --- Rendering integration (spawns Python subprocesses) ---
     python_exe: String,
@@ -204,6 +209,11 @@ struct MitsubaXmlApp {
     render_spp: u32,
     render_out_path: String,
     drjit_libllvm_path: String,
+
+    // --- Fitting (nvdiffrast) ---
+    fit_steps: u32,
+    fit_lr: f32,
+    fit_out_dir: String,
 
     job: RenderJobState,
 
@@ -221,6 +231,19 @@ struct MitsubaXmlApp {
     state_last_save: Option<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTab {
+    Scene,
+    Render,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainTab {
+    Preview,
+    Log,
+    Xml,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedState {
     config: CornellBoxConfig,
@@ -231,6 +254,10 @@ struct PersistedState {
     render_spp: u32,
     render_out_path: String,
     drjit_libllvm_path: String,
+
+    fit_steps: u32,
+    fit_lr: f32,
+    fit_out_dir: String,
 
     preview_path: String,
     preview_zoom: f32,
@@ -254,7 +281,7 @@ struct RenderJobResult {
     stderr: String,
 }
 
-impl MitsubaXmlApp {
+impl MitsubaStudioApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::new_default();
         if let Some(st) = app.load_state_from_disk() {
@@ -275,6 +302,10 @@ impl MitsubaXmlApp {
             last_status: "".to_string(),
             xml_preview,
 
+            sidebar_tab: SidebarTab::Scene,
+            main_tab: MainTab::Preview,
+            style_applied: false,
+
             // Default paths assume `current_dir` will be the workspace root (we set it when spawning).
             python_exe: ".venv/bin/python".to_string(),
             render_scene_path: "scenes/cbox.xml".to_string(),
@@ -282,6 +313,10 @@ impl MitsubaXmlApp {
             render_spp: 64,
             render_out_path: "renders/preview.png".to_string(),
             drjit_libllvm_path,
+
+            fit_steps: 400,
+            fit_lr: 0.05,
+            fit_out_dir: "renders/fit".to_string(),
 
             job: RenderJobState::Idle,
 
@@ -298,12 +333,25 @@ impl MitsubaXmlApp {
         }
     }
 
+    fn apply_style(ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.visuals.window_rounding = egui::Rounding::same(10.0);
+        style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+        style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+        style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+        ctx.set_style(style);
+    }
+
     fn regenerate_preview(&mut self) {
         self.xml_preview = generate_cbox_xml(&self.config);
     }
 
     fn state_file_path(&self) -> PathBuf {
-        self.workspace_root().join(".mitsuba_xml_gui_state.json")
+        self.workspace_root().join(".mitsuba_studio_state.json")
     }
 
     fn load_state_from_disk(&self) -> Option<PersistedState> {
@@ -329,6 +377,10 @@ impl MitsubaXmlApp {
         self.preview_zoom = st.preview_zoom;
         self.preview_auto_refresh = st.preview_auto_refresh;
         self.preview_refresh_interval_secs = st.preview_refresh_interval_secs;
+
+        self.fit_steps = st.fit_steps;
+        self.fit_lr = st.fit_lr;
+        self.fit_out_dir = st.fit_out_dir;
     }
 
     fn mark_state_dirty(&mut self) {
@@ -356,6 +408,10 @@ impl MitsubaXmlApp {
             render_spp: self.render_spp,
             render_out_path: self.render_out_path.clone(),
             drjit_libllvm_path: self.drjit_libllvm_path.clone(),
+
+            fit_steps: self.fit_steps,
+            fit_lr: self.fit_lr,
+            fit_out_dir: self.fit_out_dir.clone(),
 
             preview_path: self.preview_path.clone(),
             preview_zoom: self.preview_zoom,
@@ -428,11 +484,8 @@ impl MitsubaXmlApp {
         let size = [rgba.width() as usize, rgba.height() as usize];
         let color_image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
 
-        self.preview_texture = Some(ctx.load_texture(
-            "preview_png",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ));
+        self.preview_texture =
+            Some(ctx.load_texture("preview_png", color_image, egui::TextureOptions::LINEAR));
         self.preview_error.clear();
         if set_status {
             self.last_status = format!("Loaded preview: {}", path.display());
@@ -461,12 +514,9 @@ impl MitsubaXmlApp {
     }
 
     fn workspace_root(&self) -> PathBuf {
-        // This binary typically runs with cwd = crate dir (mitsuba_xml_gui).
-        // We want relative paths in the UI to be based on the workspace root.
-        std::env::current_dir()
-            .ok()
-            .and_then(|p| p.parent().map(|parent| parent.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from(".."))
+        // Anchor all relative paths to the repository root.
+        // When this crate lives at the repo root, CARGO_MANIFEST_DIR is exactly what we want.
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
     fn can_start_job(&self) -> bool {
@@ -581,8 +631,13 @@ fn default_drjit_libllvm_path() -> String {
     String::new()
 }
 
-impl eframe::App for MitsubaXmlApp {
+impl eframe::App for MitsubaStudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.style_applied {
+            Self::apply_style(ctx);
+            self.style_applied = true;
+        }
+
         // Periodic preview refresh (every N seconds)
         self.maybe_refresh_preview(ctx);
 
@@ -610,232 +665,471 @@ impl eframe::App for MitsubaXmlApp {
             }
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Ready");
-                if !self.last_status.is_empty() {
-                    ui.separator();
-                    ui.label(&self.last_status);
-                }
+        let running = matches!(self.job, RenderJobState::Running { .. });
+
+        egui::TopBottomPanel::top("top_bar")
+            .resizable(false)
+            .exact_height(44.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.columns(3, |cols| {
+                    cols[0].horizontal(|ui| {
+                        ui.label(egui::RichText::new("Mitsuba Studio").strong().size(18.0));
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.add_enabled_ui(!running, |ui| {
+                            if ui.button("Render").clicked() {
+                                self.mark_state_dirty();
+                                if self.write_xml_to_scene_path() {
+                                    self.start_python_job(vec![
+                                        "tools/mitsuba_render.py".to_string(),
+                                        "--scene".to_string(),
+                                        self.render_scene_path.clone(),
+                                        "--variant".to_string(),
+                                        self.render_variant.clone(),
+                                        "--spp".to_string(),
+                                        self.render_spp.to_string(),
+                                        "--out".to_string(),
+                                        self.render_out_path.clone(),
+                                    ]);
+                                }
+                            }
+
+                            if ui.button("Diff Render").clicked() {
+                                self.mark_state_dirty();
+                                if self.write_xml_to_scene_path() {
+                                    self.start_python_job(vec![
+                                        "tools/mitsuba_diff_smoketest.py".to_string(),
+                                        "--scene".to_string(),
+                                        self.render_scene_path.clone(),
+                                        "--variant".to_string(),
+                                        "llvm_ad_rgb".to_string(),
+                                        "--spp".to_string(),
+                                        "4".to_string(),
+                                    ]);
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        ui.label("Variant");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.render_variant)
+                                .desired_width(120.0),
+                        );
+                        ui.label("SPP");
+                        ui.add(
+                            egui::DragValue::new(&mut self.render_spp)
+                                .speed(1)
+                                .range(1..=4096),
+                        );
+                    });
+
+                    cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if running {
+                            ui.label(
+                                egui::RichText::new("Running…").color(egui::Color32::LIGHT_YELLOW),
+                            );
+                        }
+                        if !self.last_status.is_empty() {
+                            ui.label(&self.last_status);
+                        }
+                    });
+                });
             });
-        });
 
         egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(360.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Parameters");
-                    ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Scene, "Scene");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Render, "Render");
+                });
+                ui.separator();
 
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut changed = false;
                     let mut state_changed = false;
 
-                    egui::CollapsingHeader::new("Camera (sensor)")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        changed |= ui
-                            .add(egui::Slider::new(&mut self.config.camera.fov_deg, 10.0..=120.0).text("FOV (deg)"))
-                            .changed();
-                        changed |= vec3_ui(ui, "origin", &mut self.config.camera.origin, -50.0..=50.0);
-                        changed |= vec3_ui(ui, "target", &mut self.config.camera.target, -50.0..=50.0);
-                        changed |= vec3_ui(ui, "up", &mut self.config.camera.up, -1.0..=1.0);
-                        });
-
-                    egui::CollapsingHeader::new("Film")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut self.config.film.width).speed(1).range(16..=8192))
-                            .changed();
-                        ui.label("width");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut self.config.film.height).speed(1).range(16..=8192))
-                            .changed();
-                        ui.label("height");
-                        });
-
-                    egui::CollapsingHeader::new("Sampler")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.sampler.sample_count)
-                                    .speed(1)
-                                    .range(1..=4096),
-                            )
-                            .changed();
-                        ui.label("sample_count (independent sampler; affects camera preview quality)");
-                        });
-
-                    egui::CollapsingHeader::new("Light (area emitter)")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        changed |= ui.checkbox(&mut self.config.light.enabled, "Enable ceiling area light").changed();
-                        changed |= color3_ui(ui, "radiance", &mut self.config.light.radiance_rgb, 0.0..=200.0);
-                        changed |= ui
-                            .add(egui::Slider::new(&mut self.config.light.scale_xy, 0.05..=1.0).text("scale_xy"))
-                            .changed();
-                        changed |= ui
-                            .add(egui::Slider::new(&mut self.config.light.y, 0.5..=3.0).text("y"))
-                            .changed();
-                        });
-
-                    egui::CollapsingHeader::new("Object")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        changed |= ui.checkbox(&mut self.config.object.enabled, "Enable object").changed();
-
-                        ui.horizontal(|ui| {
-                            ui.label("type");
-                            egui::ComboBox::from_id_salt("object_kind")
-                                .selected_text(match self.config.object.kind {
-                                    ObjectKind::Sphere => "sphere",
-                                    ObjectKind::Cube => "cube",
-                                    ObjectKind::PlyMesh => "ply mesh",
-                                    ObjectKind::ObjMesh => "obj mesh",
-                                })
-                                .show_ui(ui, |ui| {
+                    match self.sidebar_tab {
+                        SidebarTab::Scene => {
+                            egui::CollapsingHeader::new("Camera")
+                                .default_open(true)
+                                .show(ui, |ui| {
                                     changed |= ui
-                                        .selectable_value(&mut self.config.object.kind, ObjectKind::Sphere, "sphere")
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.config.camera.fov_deg,
+                                                10.0..=120.0,
+                                            )
+                                            .text("FOV (deg)"),
+                                        )
+                                        .changed();
+                                    changed |= vec3_ui(
+                                        ui,
+                                        "origin",
+                                        &mut self.config.camera.origin,
+                                        -50.0..=50.0,
+                                    );
+                                    changed |= vec3_ui(
+                                        ui,
+                                        "target",
+                                        &mut self.config.camera.target,
+                                        -50.0..=50.0,
+                                    );
+                                    changed |=
+                                        vec3_ui(ui, "up", &mut self.config.camera.up, -1.0..=1.0);
+                                });
+
+                            egui::CollapsingHeader::new("Film")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("film_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Width");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.film.width,
+                                                    )
+                                                    .speed(1)
+                                                    .range(16..=8192),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Height");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.film.height,
+                                                    )
+                                                    .speed(1)
+                                                    .range(16..=8192),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+                                        });
+                                });
+
+                            egui::CollapsingHeader::new("Sampler")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("sampler_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Sample count");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.sampler.sample_count,
+                                                    )
+                                                    .speed(1)
+                                                    .range(1..=4096),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+                                        });
+                                });
+
+                            egui::CollapsingHeader::new("Light")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    changed |= ui
+                                        .checkbox(
+                                            &mut self.config.light.enabled,
+                                            "Enable ceiling area light",
+                                        )
+                                        .changed();
+                                    changed |= color3_ui(
+                                        ui,
+                                        "radiance",
+                                        &mut self.config.light.radiance_rgb,
+                                        0.0..=200.0,
+                                    );
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.config.light.scale_xy,
+                                                0.05..=1.0,
+                                            )
+                                            .text("scale_xy"),
+                                        )
                                         .changed();
                                     changed |= ui
-                                        .selectable_value(&mut self.config.object.kind, ObjectKind::Cube, "cube")
-                                        .changed();
-                                    changed |= ui
-                                        .selectable_value(&mut self.config.object.kind, ObjectKind::PlyMesh, "ply mesh")
-                                        .changed();
-                                    changed |= ui
-                                        .selectable_value(&mut self.config.object.kind, ObjectKind::ObjMesh, "obj mesh")
+                                        .add(
+                                            egui::Slider::new(&mut self.config.light.y, 0.5..=3.0)
+                                                .text("y"),
+                                        )
                                         .changed();
                                 });
-                        });
 
-                        changed |= vec3_ui(ui, "translate", &mut self.config.object.translate, -2.0..=2.0);
+                            egui::CollapsingHeader::new("Object")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    changed |= ui
+                                        .checkbox(&mut self.config.object.enabled, "Enable object")
+                                        .changed();
 
-                        match self.config.object.kind {
-                            ObjectKind::Sphere => {
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut self.config.object.sphere_radius, 0.05..=1.0).text("radius"))
-                                    .changed();
-                            }
-                            ObjectKind::Cube => {
-                                changed |= vec3_ui(ui, "scale", &mut self.config.object.cube_scale, 0.05..=2.0);
-                            }
-                            ObjectKind::PlyMesh => {
-                                ui.label("ply filename (relative paths ok)");
-                                ui.horizontal(|ui| {
-                                    changed |= ui.text_edit_singleline(&mut self.config.object.ply_filename).changed();
-                                    if ui.button("Browse...").clicked() {
-                                        self.maybe_pick_ply_file();
-                                        changed = true;
+                                    ui.horizontal(|ui| {
+                                        ui.label("Type");
+                                        egui::ComboBox::from_id_salt("object_kind")
+                                            .selected_text(match self.config.object.kind {
+                                                ObjectKind::Sphere => "sphere",
+                                                ObjectKind::Cube => "cube",
+                                                ObjectKind::PlyMesh => "ply mesh",
+                                                ObjectKind::ObjMesh => "obj mesh",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.object.kind,
+                                                        ObjectKind::Sphere,
+                                                        "sphere",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.object.kind,
+                                                        ObjectKind::Cube,
+                                                        "cube",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.object.kind,
+                                                        ObjectKind::PlyMesh,
+                                                        "ply mesh",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.object.kind,
+                                                        ObjectKind::ObjMesh,
+                                                        "obj mesh",
+                                                    )
+                                                    .changed();
+                                            });
+                                    });
+
+                                    changed |= vec3_ui(
+                                        ui,
+                                        "translate",
+                                        &mut self.config.object.translate,
+                                        -2.0..=2.0,
+                                    );
+
+                                    match self.config.object.kind {
+                                        ObjectKind::Sphere => {
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.object.sphere_radius,
+                                                        0.05..=1.0,
+                                                    )
+                                                    .text("radius"),
+                                                )
+                                                .changed();
+                                        }
+                                        ObjectKind::Cube => {
+                                            changed |= vec3_ui(
+                                                ui,
+                                                "scale",
+                                                &mut self.config.object.cube_scale,
+                                                0.05..=2.0,
+                                            );
+                                        }
+                                        ObjectKind::PlyMesh => {
+                                            ui.label("PLY (relative to scenes/)");
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .text_edit_singleline(
+                                                        &mut self.config.object.ply_filename,
+                                                    )
+                                                    .changed();
+                                                if ui.button("Browse").clicked() {
+                                                    self.maybe_pick_ply_file();
+                                                    changed = true;
+                                                }
+                                            });
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.object.mesh_scale,
+                                                        0.01..=10.0,
+                                                    )
+                                                    .text("mesh_scale"),
+                                                )
+                                                .changed();
+                                        }
+                                        ObjectKind::ObjMesh => {
+                                            ui.label("OBJ (relative to scenes/)");
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .text_edit_singleline(
+                                                        &mut self.config.object.obj_filename,
+                                                    )
+                                                    .changed();
+                                                if ui.button("Browse").clicked() {
+                                                    self.maybe_pick_obj_file();
+                                                    changed = true;
+                                                }
+                                            });
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.object.mesh_scale,
+                                                        0.01..=10.0,
+                                                    )
+                                                    .text("mesh_scale"),
+                                                )
+                                                .changed();
+                                        }
                                     }
+
+                                    ui.add_space(10.0);
+                                    egui::CollapsingHeader::new("Material (BSDF)")
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            changed |= bsdf_node_ui(
+                                                ui,
+                                                &self.workspace_root(),
+                                                &mut self.config.object.bsdf,
+                                                0,
+                                            );
+                                        });
                                 });
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut self.config.object.mesh_scale, 0.01..=10.0).text("mesh_scale"))
-                                    .changed();
-                            }
-                            ObjectKind::ObjMesh => {
-                                ui.label("obj filename (relative paths ok)");
-                                ui.horizontal(|ui| {
-                                    changed |= ui.text_edit_singleline(&mut self.config.object.obj_filename).changed();
-                                    if ui.button("Browse...").clicked() {
-                                        self.maybe_pick_obj_file();
-                                        changed = true;
-                                    }
-                                });
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut self.config.object.mesh_scale, 0.01..=10.0).text("mesh_scale"))
-                                    .changed();
-                            }
                         }
+                        SidebarTab::Render => {
+                            ui.label("Runs Python scripts in the workspace root.");
+                            ui.add_space(6.0);
 
-                        ui.add_space(8.0);
-                        egui::CollapsingHeader::new("Material (BSDF)")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                changed |= bsdf_node_ui(ui, &self.workspace_root(), &mut self.config.object.bsdf, 0);
-                            });
-                        });
+                            egui::Grid::new("render_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(10.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.label("Python");
+                                    state_changed |=
+                                        ui.text_edit_singleline(&mut self.python_exe).changed();
+                                    ui.end_row();
 
-                    ui.separator();
+                                    ui.label("Scene");
+                                    state_changed |= ui
+                                        .text_edit_singleline(&mut self.render_scene_path)
+                                        .changed();
+                                    ui.end_row();
 
-                    egui::CollapsingHeader::new("Render")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                        ui.label("This spawns Python scripts in the workspace root.");
+                                    ui.label("Variant");
+                                    state_changed |=
+                                        ui.text_edit_singleline(&mut self.render_variant).changed();
+                                    ui.end_row();
 
-                        ui.horizontal(|ui| {
-                            ui.label("python");
-                            state_changed |= ui.text_edit_singleline(&mut self.python_exe).changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("scene");
-                            state_changed |= ui.text_edit_singleline(&mut self.render_scene_path).changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("variant");
-                            state_changed |= ui.text_edit_singleline(&mut self.render_variant).changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("spp");
-                            state_changed |= ui
-                                .add(egui::DragValue::new(&mut self.render_spp).speed(1).range(1..=4096))
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("out");
-                            state_changed |= ui.text_edit_singleline(&mut self.render_out_path).changed();
-                        });
+                                    ui.label("SPP");
+                                    state_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut self.render_spp)
+                                                .speed(1)
+                                                .range(1..=4096),
+                                        )
+                                        .changed();
+                                    ui.end_row();
 
-                        ui.add_space(6.0);
+                                    ui.label("Output");
+                                    state_changed |= ui
+                                        .text_edit_singleline(&mut self.render_out_path)
+                                        .changed();
+                                    ui.end_row();
+                                });
 
-                        ui.label("Optional (macOS): DRJIT_LIBLLVM_PATH for llvm_ad_* variants");
-                        state_changed |= ui.text_edit_singleline(&mut self.drjit_libllvm_path).changed();
-                        ui.label("Example: /opt/homebrew/opt/llvm/lib/libLLVM.dylib");
+                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new("Advanced")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label("macOS: DRJIT_LIBLLVM_PATH for llvm_ad_* variants");
+                                    state_changed |= ui
+                                        .text_edit_singleline(&mut self.drjit_libllvm_path)
+                                        .changed();
+                                    ui.label("Example: /opt/homebrew/opt/llvm/lib/libLLVM.dylib");
+                                });
 
-                        let running = matches!(self.job, RenderJobState::Running { .. });
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new("Fit material (nvdiffrast)")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        "Fits a differentiable raster approximation to Mitsuba ground truth. \
+Run on a CUDA machine (e.g. Windows + NVIDIA).",
+                                    );
+
+                                    egui::Grid::new("fit_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 8.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Steps");
+                                            state_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut self.fit_steps)
+                                                        .speed(10)
+                                                        .range(10..=20000),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("LR");
+                                            state_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut self.fit_lr)
+                                                        .speed(0.005)
+                                                        .range(1e-5..=1.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Out dir");
+                                            state_changed |= ui.text_edit_singleline(&mut self.fit_out_dir).changed();
+                                            ui.end_row();
+                                        });
+
+                                    ui.add_space(8.0);
+                                    ui.add_enabled_ui(!running, |ui| {
+                                        if ui.button("Fit diffuse albedo").clicked() {
+                                            self.mark_state_dirty();
+                                            if self.write_xml_to_scene_path() {
+                                                self.start_python_job(vec![
+                                                    "tools/mitsuba_raster_fit_nvdiffrast.py".to_string(),
+                                                    "--scene".to_string(),
+                                                    self.render_scene_path.clone(),
+                                                    "--gt-variant".to_string(),
+                                                    self.render_variant.clone(),
+                                                    "--gt-spp".to_string(),
+                                                    self.render_spp.to_string(),
+                                                    "--steps".to_string(),
+                                                    self.fit_steps.to_string(),
+                                                    "--lr".to_string(),
+                                                    self.fit_lr.to_string(),
+                                                    "--out-dir".to_string(),
+                                                    self.fit_out_dir.clone(),
+                                                ]);
+                                            }
+                                        }
+                                    });
+                                });
+
+                            ui.add_space(10.0);
                             ui.add_enabled_ui(!running, |ui| {
-                                if ui.button("Render (preview)").clicked() {
+                                if ui.button("Write XML to scene path").clicked() {
                                     self.mark_state_dirty();
-                                    if self.write_xml_to_scene_path() {
-                                        self.start_python_job(vec![
-                                            "tools/mitsuba_render.py".to_string(),
-                                            "--scene".to_string(),
-                                            self.render_scene_path.clone(),
-                                            "--variant".to_string(),
-                                            self.render_variant.clone(),
-                                            "--spp".to_string(),
-                                            self.render_spp.to_string(),
-                                            "--out".to_string(),
-                                            self.render_out_path.clone(),
-                                        ]);
-                                    }
-                                }
-
-                                if ui.button("Diff Render (smoketest)").clicked() {
-                                    self.mark_state_dirty();
-                                    if self.write_xml_to_scene_path() {
-                                        self.start_python_job(vec![
-                                            "tools/mitsuba_diff_smoketest.py".to_string(),
-                                            "--scene".to_string(),
-                                            self.render_scene_path.clone(),
-                                            "--variant".to_string(),
-                                            "llvm_ad_rgb".to_string(),
-                                            "--spp".to_string(),
-                                            "4".to_string(),
-                                        ]);
-                                    }
+                                    let _ = self.write_xml_to_scene_path();
                                 }
                             });
-
-                            if running {
-                                ui.label("Running...");
-                            }
-                        });
-                        });
+                        }
+                    }
 
                     if changed {
                         self.regenerate_preview();
@@ -848,54 +1142,81 @@ impl eframe::App for MitsubaXmlApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::CollapsingHeader::new("Preview")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("path");
-                            if ui.text_edit_singleline(&mut self.preview_path).changed() {
-                                self.mark_state_dirty();
-                            }
-                            if ui.button("Use render out").clicked() {
-                                self.preview_path = self.render_out_path.clone();
-                                self.mark_state_dirty();
-                            }
-                            if ui.button("Reload").clicked() {
-                                self.load_preview_texture(ctx, true);
-                            }
-                            if ui.checkbox(&mut self.preview_auto_refresh, "Auto refresh").changed() {
-                                self.mark_state_dirty();
-                            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.main_tab, MainTab::Preview, "Preview");
+                ui.selectable_value(&mut self.main_tab, MainTab::Log, "Log");
+                ui.selectable_value(&mut self.main_tab, MainTab::Xml, "XML");
+            });
+            ui.separator();
 
-                            ui.add_enabled_ui(self.preview_auto_refresh, |ui| {
-                                ui.label("interval (s)");
-                                if ui
-                                    .add(
+            match self.main_tab {
+                MainTab::Preview => {
+                    ui.horizontal(|ui| {
+                        ui.label("Preview");
+                        ui.add_space(8.0);
+                        ui.label("Path");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.preview_path)
+                                    .desired_width(260.0),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        if ui.button("Use output").clicked() {
+                            self.preview_path = self.render_out_path.clone();
+                            self.mark_state_dirty();
+                        }
+                        if ui.button("Reload").clicked() {
+                            self.load_preview_texture(ctx, true);
+                        }
+                        if ui
+                            .checkbox(&mut self.preview_auto_refresh, "Auto")
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        ui.add_enabled_ui(self.preview_auto_refresh, |ui| {
+                            ui.label("Every (s)");
+                            if ui
+                                .add(
                                     egui::DragValue::new(&mut self.preview_refresh_interval_secs)
                                         .speed(0.1)
                                         .range(0.2..=60.0),
                                 )
                                 .changed()
-                                {
-                                    self.mark_state_dirty();
-                                }
-                            });
+                            {
+                                self.mark_state_dirty();
+                            }
                         });
-
-                        // First-time auto load
-                        if self.preview_texture.is_none() && self.preview_error.is_empty() {
-                            self.load_preview_texture(ctx, false);
+                        ui.separator();
+                        ui.label("Zoom");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.preview_zoom, 0.25..=2.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
                         }
+                        ui.label(format!("{:.2}×", self.preview_zoom));
+                    });
+                    ui.add_space(8.0);
 
-                        // Allocate a reasonably tall area so the image can fill it.
-                        let preview_area_h = 420.0_f32;
-                        let preview_area_w = ui.available_width().max(1.0);
+                    // First-time auto load
+                    if self.preview_texture.is_none() && self.preview_error.is_empty() {
+                        self.load_preview_texture(ctx, false);
+                    }
 
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(preview_area_w, preview_area_h),
-                            egui::Sense::hover(),
-                        );
+                    let available = ui.available_size();
+                    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+                    let frame = egui::Frame::canvas(ui.style())
+                        .rounding(egui::Rounding::same(12.0))
+                        .inner_margin(egui::Margin::same(12.0));
+                    frame.show(ui, |ui| {
                         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
                             ui.set_min_size(rect.size());
 
@@ -928,66 +1249,65 @@ impl eframe::App for MitsubaXmlApp {
                                 });
                             } else {
                                 ui.centered_and_justified(|ui| {
-                                    ui.label("No preview loaded");
+                                    ui.label(egui::RichText::new("No preview loaded").weak());
                                 });
                             }
                         });
-
-                        ui.add_space(6.0);
-                        if ui.add(egui::Slider::new(&mut self.preview_zoom, 0.25..=2.0).text("zoom")).changed() {
-                            self.mark_state_dirty();
-                        }
                     });
-
-                ui.add_space(8.0);
-
-                egui::CollapsingHeader::new("Render Log")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let mut log_text = String::new();
-                        match &self.job {
-                            RenderJobState::Idle => log_text.push_str("(idle)\n"),
-                            RenderJobState::Running { started_at, .. } => {
-                                log_text.push_str(&format!(
-                                    "Running for {:.1}s...\n",
-                                    started_at.elapsed().as_secs_f32()
-                                ));
+                }
+                MainTab::Log => {
+                    let mut log_text = String::new();
+                    match &self.job {
+                        RenderJobState::Idle => log_text.push_str("(idle)\n"),
+                        RenderJobState::Running { started_at, .. } => {
+                            log_text.push_str(&format!(
+                                "Running for {:.1}s...\n",
+                                started_at.elapsed().as_secs_f32()
+                            ));
+                        }
+                        RenderJobState::Finished(r) => {
+                            log_text.push_str(&format!("ok={} exit={:?}\n", r.ok, r.exit_code));
+                            if !r.stdout.is_empty() {
+                                log_text.push_str("\n--- stdout ---\n");
+                                log_text.push_str(&r.stdout);
                             }
-                            RenderJobState::Finished(r) => {
-                                log_text.push_str(&format!("ok={} exit={:?}\n", r.ok, r.exit_code));
-                                if !r.stdout.is_empty() {
-                                    log_text.push_str("\n--- stdout ---\n");
-                                    log_text.push_str(&r.stdout);
-                                }
-                                if !r.stderr.is_empty() {
-                                    log_text.push_str("\n--- stderr ---\n");
-                                    log_text.push_str(&r.stderr);
-                                }
+                            if !r.stderr.is_empty() {
+                                log_text.push_str("\n--- stderr ---\n");
+                                log_text.push_str(&r.stderr);
                             }
                         }
+                    }
 
-                        ui.add(
-                            egui::TextEdit::multiline(&mut log_text)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(12)
-                                ,
-                        );
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = log_text.clone());
+                        }
                     });
+                    ui.add_space(6.0);
 
-                ui.add_space(8.0);
-
-                egui::CollapsingHeader::new("XML Preview")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.xml_preview)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(30),
-                        );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut log_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(28),
+                    );
+                }
+                MainTab::Xml => {
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.xml_preview.clone());
+                        }
                     });
-            });
+                    ui.add_space(6.0);
+
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.xml_preview)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(40),
+                    );
+                }
+            }
         });
 
         // Persist GUI state (throttled)
@@ -995,29 +1315,72 @@ impl eframe::App for MitsubaXmlApp {
     }
 }
 
-fn vec3_ui(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], range: std::ops::RangeInclusive<f32>) -> bool {
+fn vec3_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut [f32; 3],
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(label);
-        changed |= ui.add(egui::DragValue::new(&mut v[0]).range(range.clone()).speed(0.01)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut v[1]).range(range.clone()).speed(0.01)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut v[2]).range(range).speed(0.01)).changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut v[0])
+                    .range(range.clone())
+                    .speed(0.01),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut v[1])
+                    .range(range.clone())
+                    .speed(0.01),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::DragValue::new(&mut v[2]).range(range).speed(0.01))
+            .changed();
     });
     changed
 }
 
-fn color3_ui(ui: &mut egui::Ui, label: &str, c: &mut [f32; 3], range: std::ops::RangeInclusive<f32>) -> bool {
+fn color3_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    c: &mut [f32; 3],
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(label);
-        changed |= ui.add(egui::DragValue::new(&mut c[0]).range(range.clone()).speed(0.01)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut c[1]).range(range.clone()).speed(0.01)).changed();
-        changed |= ui.add(egui::DragValue::new(&mut c[2]).range(range).speed(0.01)).changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut c[0])
+                    .range(range.clone())
+                    .speed(0.01),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut c[1])
+                    .range(range.clone())
+                    .speed(0.01),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::DragValue::new(&mut c[2]).range(range).speed(0.01))
+            .changed();
     });
     changed
 }
 
-fn bsdf_node_ui(ui: &mut egui::Ui, workspace_root: &PathBuf, node: &mut BsdfNode, depth: usize) -> bool {
+fn bsdf_node_ui(
+    ui: &mut egui::Ui,
+    workspace_root: &PathBuf,
+    node: &mut BsdfNode,
+    depth: usize,
+) -> bool {
     let mut changed = false;
     if depth >= 3 {
         ui.colored_label(egui::Color32::LIGHT_RED, "Max BSDF nesting depth reached");
@@ -1184,7 +1547,13 @@ fn bsdf_node_ui(ui: &mut egui::Ui, workspace_root: &PathBuf, node: &mut BsdfNode
     changed
 }
 
-fn param_value_ui(ui: &mut egui::Ui, workspace_root: &PathBuf, v: &mut ParamValue, depth: usize, idx: usize) -> bool {
+fn param_value_ui(
+    ui: &mut egui::Ui,
+    workspace_root: &PathBuf,
+    v: &mut ParamValue,
+    depth: usize,
+    idx: usize,
+) -> bool {
     let mut changed = false;
 
     match v {
@@ -1230,7 +1599,8 @@ fn param_value_ui(ui: &mut egui::Ui, workspace_root: &PathBuf, v: &mut ParamValu
                         .add_filter(
                             "Images",
                             &[
-                                "png", "jpg", "jpeg", "tga", "bmp", "exr", "hdr", "pfm", "tif", "tiff",
+                                "png", "jpg", "jpeg", "tga", "bmp", "exr", "hdr", "pfm", "tif",
+                                "tiff",
                             ],
                         )
                         .pick_file();
@@ -1260,7 +1630,10 @@ fn param_value_ui(ui: &mut egui::Ui, workspace_root: &PathBuf, v: &mut ParamValu
 
 fn emit_bsdf_xml(out: &mut String, node: &BsdfNode, indent: usize) {
     let pad = " ".repeat(indent);
-    out.push_str(&format!("{pad}<bsdf type=\"{}\">\n", escape_xml_attr(&node.plugin_type)));
+    out.push_str(&format!(
+        "{pad}<bsdf type=\"{}\">\n",
+        escape_xml_attr(&node.plugin_type)
+    ));
 
     for p in &node.params {
         emit_param_xml(out, p, indent + 4);
@@ -1317,7 +1690,9 @@ fn emit_param_xml(out: &mut String, p: &BsdfParam, indent: usize) {
                 "{pad}    <string name=\"filename\" value=\"{}\"/>\n",
                 escape_xml_attr(filename)
             ));
-            out.push_str(&format!("{pad}    <boolean name=\"raw\" value=\"{raw}\"/>\n"));
+            out.push_str(&format!(
+                "{pad}    <boolean name=\"raw\" value=\"{raw}\"/>\n"
+            ));
             out.push_str(&format!("{pad}</texture>\n"));
         }
     }
