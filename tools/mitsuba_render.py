@@ -44,6 +44,11 @@ def main() -> int:
     scene = mi.load_file(args.scene)
     image = mi.render(scene, spp=args.spp)
 
+    # Ensure output directory exists
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     out_lower = args.out.lower()
     if out_lower.endswith((".exr", ".hdr", ".pfm")):
         # HDR output: keep linear values.

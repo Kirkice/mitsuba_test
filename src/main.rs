@@ -1,7 +1,13 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
@@ -216,6 +222,7 @@ struct MitsubaStudioApp {
     fit_out_dir: String,
 
     job: RenderJobState,
+    training_progress: Option<TrainingProgress>,
 
     // --- Embedded preview image ---
     preview_path: String,
@@ -270,6 +277,7 @@ enum RenderJobState {
     Running {
         started_at: Instant,
         rx: mpsc::Receiver<RenderJobResult>,
+        live_log: Arc<Mutex<Vec<String>>>,
     },
     Finished(RenderJobResult),
 }
@@ -281,6 +289,20 @@ struct RenderJobResult {
     stderr: String,
 }
 
+#[derive(Debug, Clone)]
+struct TrainingProgress {
+    step: u32,
+    total_steps: u32,
+    loss: f32,
+    // Simple diffuse fitting
+    albedo: Option<[f32; 3]>,
+    // Disney BRDF parameters
+    base_color: Option<[f32; 3]>,
+    roughness: Option<f32>,
+    metallic: Option<f32>,
+    specular: Option<f32>,
+}
+
 impl MitsubaStudioApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::new_default();
@@ -288,8 +310,153 @@ impl MitsubaStudioApp {
             app.apply_persisted_state(st);
             app.last_status = "Loaded previous GUI state".to_string();
         }
+
+        // Auto-fix Python path for cross-platform compatibility
+        app.python_exe = Self::normalize_python_path(&app.python_exe);
+
         app.regenerate_preview();
         app
+    }
+
+    /// Normalize and validate Python path for the current platform
+    fn normalize_python_path(path: &str) -> String {
+        let trimmed = path.trim();
+
+        // If it's just "python" or "python3", keep it as is (system Python)
+        if trimmed == "python" || trimmed == "python3" || trimmed == "py" {
+            return trimmed.to_string();
+        }
+
+        // Check if the provided path exists and is valid
+        let path_buf = PathBuf::from(trimmed);
+        if path_buf.is_file() {
+            return trimmed.to_string();
+        }
+
+        // Auto-detect platform-specific virtual environment path
+        let venv_paths = if cfg!(windows) {
+            vec![
+                ".venv/Scripts/python.exe",
+                ".venv\\Scripts\\python.exe",
+                "venv/Scripts/python.exe",
+                "venv\\Scripts\\python.exe",
+            ]
+        } else {
+            vec![
+                ".venv/bin/python",
+                ".venv/bin/python3",
+                "venv/bin/python",
+                "venv/bin/python3",
+            ]
+        };
+
+        // Try to find an existing Python executable
+        for venv_path in &venv_paths {
+            let pb = PathBuf::from(venv_path);
+            if pb.is_file() {
+                return venv_path.to_string();
+            }
+        }
+
+        // If nothing found, return platform-appropriate default
+        Self::get_default_python_path()
+    }
+
+    /// Get platform-specific default Python path
+    fn get_default_python_path() -> String {
+        if cfg!(windows) {
+            ".venv/Scripts/python.exe".to_string()
+        } else if cfg!(target_os = "macos") {
+            ".venv/bin/python3".to_string()
+        } else {
+            ".venv/bin/python".to_string()
+        }
+    }
+
+    fn parse_training_progress(line: &str, total_steps: u32) -> Option<TrainingProgress> {
+        // Parse training log supporting both simple and Disney BRDF formats:
+        // Simple: "step=0025 loss=0.123456 albedo=[0.1 0.2 0.3]"
+        // Disney: "step=0025 loss=0.123456 baseColor=[0.1 0.2 0.3] roughness=0.5 metallic=0.0 specular=0.5"
+
+        if !line.contains("step=") || !line.contains("loss=") {
+            return None;
+        }
+
+        let step = line
+            .split("step=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()?;
+
+        let loss = line
+            .split("loss=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<f32>()
+            .ok()?;
+
+        // Try parsing Disney BRDF parameters first
+        let base_color = Self::parse_vec3_param(line, "baseColor");
+        let roughness = Self::parse_float_param(line, "roughness");
+        let metallic = Self::parse_float_param(line, "metallic");
+        let specular = Self::parse_float_param(line, "specular");
+
+        // If Disney params found, use them
+        if base_color.is_some() || roughness.is_some() {
+            return Some(TrainingProgress {
+                step,
+                total_steps,
+                loss,
+                albedo: None,
+                base_color,
+                roughness,
+                metallic,
+                specular,
+            });
+        }
+
+        // Otherwise try parsing simple albedo
+        let albedo = Self::parse_vec3_param(line, "albedo");
+
+        Some(TrainingProgress {
+            step,
+            total_steps,
+            loss,
+            albedo,
+            base_color: None,
+            roughness: None,
+            metallic: None,
+            specular: None,
+        })
+    }
+
+    fn parse_vec3_param(line: &str, param_name: &str) -> Option<[f32; 3]> {
+        let param_str = line.split(&format!("{}=", param_name)).nth(1)?;
+        let values: Vec<f32> = param_str
+            .trim_start_matches('[')
+            .split(']')
+            .next()?
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f32>().ok())
+            .collect();
+
+        if values.len() == 3 {
+            Some([values[0], values[1], values[2]])
+        } else {
+            None
+        }
+    }
+
+    fn parse_float_param(line: &str, param_name: &str) -> Option<f32> {
+        line.split(&format!("{}=", param_name))
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<f32>()
+            .ok()
     }
 
     fn new_default() -> Self {
@@ -307,7 +474,7 @@ impl MitsubaStudioApp {
             style_applied: false,
 
             // Default paths assume `current_dir` will be the workspace root (we set it when spawning).
-            python_exe: ".venv/bin/python".to_string(),
+            python_exe: Self::get_default_python_path(),
             render_scene_path: "scenes/cbox.xml".to_string(),
             render_variant: "scalar_rgb".to_string(),
             render_spp: 64,
@@ -319,6 +486,7 @@ impl MitsubaStudioApp {
             fit_out_dir: "renders/fit".to_string(),
 
             job: RenderJobState::Idle,
+            training_progress: None,
 
             preview_path: "renders/preview.png".to_string(),
             preview_texture: None,
@@ -529,13 +697,21 @@ impl MitsubaStudioApp {
             return;
         }
 
+        // Normalize Python path before starting job
+        self.python_exe = Self::normalize_python_path(&self.python_exe);
+
         let (tx, rx) = mpsc::channel::<RenderJobResult>();
+        let live_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let live_log_clone = Arc::clone(&live_log);
 
         let cwd = self.workspace_root();
         let python_exe = self.python_exe.trim().to_string();
         let drjit_libllvm_path = self.drjit_libllvm_path.trim().to_string();
 
         std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            use std::process::Stdio;
+
             let mut cmd = std::process::Command::new(python_exe);
             cmd.current_dir(cwd);
             for a in &args {
@@ -545,14 +721,54 @@ impl MitsubaStudioApp {
                 cmd.env("DRJIT_LIBLLVM_PATH", drjit_libllvm_path);
             }
 
-            let output = cmd.output();
-            let result = match output {
-                Ok(out) => RenderJobResult {
-                    ok: out.status.success(),
-                    exit_code: out.status.code(),
-                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-                },
+            // Capture stdout and stderr separately for real-time streaming
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+
+            let spawn_result = cmd.spawn();
+            let result = match spawn_result {
+                Ok(mut child) => {
+                    let mut stdout_lines = Vec::new();
+                    let mut stderr_lines = Vec::new();
+
+                    // Read stdout in real-time
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                // Append to live log
+                                if let Ok(mut log) = live_log_clone.lock() {
+                                    log.push(line.clone());
+                                }
+                                stdout_lines.push(line);
+                            }
+                        }
+                    }
+
+                    // Read stderr
+                    if let Some(stderr) = child.stderr.take() {
+                        let reader = BufReader::new(stderr);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                if let Ok(mut log) = live_log_clone.lock() {
+                                    log.push(format!("[stderr] {}", line));
+                                }
+                                stderr_lines.push(line);
+                            }
+                        }
+                    }
+
+                    let status = child.wait().unwrap_or_else(|_| {
+                        std::process::ExitStatus::from_raw(1)
+                    });
+
+                    RenderJobResult {
+                        ok: status.success(),
+                        exit_code: status.code(),
+                        stdout: stdout_lines.join("\n"),
+                        stderr: stderr_lines.join("\n"),
+                    }
+                }
                 Err(err) => RenderJobResult {
                     ok: false,
                     exit_code: None,
@@ -568,6 +784,7 @@ impl MitsubaStudioApp {
         self.job = RenderJobState::Running {
             started_at: Instant::now(),
             rx,
+            live_log,
         };
     }
 
@@ -641,8 +858,21 @@ impl eframe::App for MitsubaStudioApp {
         // Periodic preview refresh (every N seconds)
         self.maybe_refresh_preview(ctx);
 
-        // Poll subprocess results
-        if let RenderJobState::Running { started_at: _, rx } = &self.job {
+        // Poll subprocess results and parse training progress
+        if let RenderJobState::Running { started_at: _, rx, live_log } = &self.job {
+            // Parse latest training progress from live log
+            if let Ok(log) = live_log.lock() {
+                if !log.is_empty() {
+                    // Parse from the last few lines
+                    for line in log.iter().rev().take(10) {
+                        if let Some(progress) = Self::parse_training_progress(line, self.fit_steps) {
+                            self.training_progress = Some(progress);
+                            break;
+                        }
+                    }
+                }
+            }
+
             match rx.try_recv() {
                 Ok(result) => {
                     self.last_status = if result.ok {
@@ -652,7 +882,10 @@ impl eframe::App for MitsubaStudioApp {
                     };
                     self.job = RenderJobState::Finished(result);
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Request repaint for live log updates
+                    ctx.request_repaint();
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.last_status = "Job channel disconnected".to_string();
                     self.job = RenderJobState::Finished(RenderJobResult {
@@ -1098,26 +1331,49 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
 
                                     ui.add_space(8.0);
                                     ui.add_enabled_ui(!running, |ui| {
-                                        if ui.button("Fit diffuse albedo").clicked() {
-                                            self.mark_state_dirty();
-                                            if self.write_xml_to_scene_path() {
-                                                self.start_python_job(vec![
-                                                    "tools/mitsuba_raster_fit_nvdiffrast.py".to_string(),
-                                                    "--scene".to_string(),
-                                                    self.render_scene_path.clone(),
-                                                    "--gt-variant".to_string(),
-                                                    self.render_variant.clone(),
-                                                    "--gt-spp".to_string(),
-                                                    self.render_spp.to_string(),
-                                                    "--steps".to_string(),
-                                                    self.fit_steps.to_string(),
-                                                    "--lr".to_string(),
-                                                    self.fit_lr.to_string(),
-                                                    "--out-dir".to_string(),
-                                                    self.fit_out_dir.clone(),
-                                                ]);
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Fit diffuse albedo").clicked() {
+                                                self.mark_state_dirty();
+                                                if self.write_xml_to_scene_path() {
+                                                    self.start_python_job(vec![
+                                                        "tools/mitsuba_raster_fit_nvdiffrast.py".to_string(),
+                                                        "--scene".to_string(),
+                                                        self.render_scene_path.clone(),
+                                                        "--gt-variant".to_string(),
+                                                        self.render_variant.clone(),
+                                                        "--gt-spp".to_string(),
+                                                        self.render_spp.to_string(),
+                                                        "--steps".to_string(),
+                                                        self.fit_steps.to_string(),
+                                                        "--lr".to_string(),
+                                                        self.fit_lr.to_string(),
+                                                        "--out-dir".to_string(),
+                                                        self.fit_out_dir.clone(),
+                                                    ]);
+                                                }
                                             }
-                                        }
+
+                                            if ui.button("Fit Disney BRDF").clicked() {
+                                                self.mark_state_dirty();
+                                                if self.write_xml_to_scene_path() {
+                                                    self.start_python_job(vec![
+                                                        "tools/mitsuba_raster_fit_disney.py".to_string(),
+                                                        "--scene".to_string(),
+                                                        self.render_scene_path.clone(),
+                                                        "--gt-variant".to_string(),
+                                                        self.render_variant.clone(),
+                                                        "--gt-spp".to_string(),
+                                                        self.render_spp.to_string(),
+                                                        "--steps".to_string(),
+                                                        self.fit_steps.to_string(),
+                                                        "--lr".to_string(),
+                                                        self.fit_lr.to_string(),
+                                                        "--out-dir".to_string(),
+                                                        format!("{}_disney", self.fit_out_dir),
+                                                    ]);
+                                                }
+                                            }
+                                        });
                                     });
                                 });
 
@@ -1256,14 +1512,99 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                     });
                 }
                 MainTab::Log => {
+                    // Show training progress if available
+                    if let Some(progress) = &self.training_progress {
+                        ui.group(|ui| {
+                            ui.heading("Training Progress");
+                            ui.add_space(4.0);
+
+                            // Progress bar
+                            let progress_ratio = progress.step as f32 / progress.total_steps.max(1) as f32;
+                            ui.add(
+                                egui::ProgressBar::new(progress_ratio)
+                                    .text(format!("Step {}/{}", progress.step, progress.total_steps))
+                                    .animate(true),
+                            );
+
+                            ui.add_space(6.0);
+                            egui::Grid::new("progress_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(10.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.label("Loss:");
+                                    ui.label(format!("{:.6}", progress.loss));
+                                    ui.end_row();
+
+                                    // Display simple albedo if available
+                                    if let Some(albedo) = progress.albedo {
+                                        ui.label("Albedo:");
+                                        ui.horizontal(|ui| {
+                                            let rgb = [
+                                                (albedo[0] * 255.0) as u8,
+                                                (albedo[1] * 255.0) as u8,
+                                                (albedo[2] * 255.0) as u8,
+                                            ];
+                                            ui.label(format!("[{:.3}, {:.3}, {:.3}]", albedo[0], albedo[1], albedo[2]));
+                                            let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                            ui.color_edit_button_srgba(&mut color);
+                                        });
+                                        ui.end_row();
+                                    }
+
+                                    // Display Disney BRDF parameters if available
+                                    if let Some(base_color) = progress.base_color {
+                                        ui.label("Base Color:");
+                                        ui.horizontal(|ui| {
+                                            let rgb = [
+                                                (base_color[0] * 255.0) as u8,
+                                                (base_color[1] * 255.0) as u8,
+                                                (base_color[2] * 255.0) as u8,
+                                            ];
+                                            ui.label(format!("[{:.3}, {:.3}, {:.3}]", base_color[0], base_color[1], base_color[2]));
+                                            let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                            ui.color_edit_button_srgba(&mut color);
+                                        });
+                                        ui.end_row();
+                                    }
+
+                                    if let Some(roughness) = progress.roughness {
+                                        ui.label("Roughness:");
+                                        ui.add(egui::ProgressBar::new(roughness).text(format!("{:.3}", roughness)));
+                                        ui.end_row();
+                                    }
+
+                                    if let Some(metallic) = progress.metallic {
+                                        ui.label("Metallic:");
+                                        ui.add(egui::ProgressBar::new(metallic).text(format!("{:.3}", metallic)));
+                                        ui.end_row();
+                                    }
+
+                                    if let Some(specular) = progress.specular {
+                                        ui.label("Specular:");
+                                        ui.add(egui::ProgressBar::new(specular).text(format!("{:.3}", specular)));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                    }
+
                     let mut log_text = String::new();
                     match &self.job {
                         RenderJobState::Idle => log_text.push_str("(idle)\n"),
-                        RenderJobState::Running { started_at, .. } => {
+                        RenderJobState::Running { started_at, live_log, .. } => {
                             log_text.push_str(&format!(
-                                "Running for {:.1}s...\n",
+                                "Running for {:.1}s...\n\n",
                                 started_at.elapsed().as_secs_f32()
                             ));
+
+                            // Show live log
+                            if let Ok(log) = live_log.lock() {
+                                for line in log.iter() {
+                                    log_text.push_str(line);
+                                    log_text.push('\n');
+                                }
+                            }
                         }
                         RenderJobState::Finished(r) => {
                             log_text.push_str(&format!("ok={} exit={:?}\n", r.ok, r.exit_code));
@@ -1282,15 +1623,23 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                         if ui.button("Copy").clicked() {
                             ui.output_mut(|o| o.copied_text = log_text.clone());
                         }
+                        if matches!(self.job, RenderJobState::Running { .. }) {
+                            ui.label(egui::RichText::new("● Live").color(egui::Color32::GREEN));
+                        }
                     });
                     ui.add_space(6.0);
 
-                    ui.add(
-                        egui::TextEdit::multiline(&mut log_text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(28),
-                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut log_text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(24),
+                            );
+                        });
                 }
                 MainTab::Xml => {
                     ui.horizontal(|ui| {
