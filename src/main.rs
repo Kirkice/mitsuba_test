@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 720.0])
+            .with_inner_size([1520.0, 1108.0])
             .with_title("Mitsuba Studio"),
         ..Default::default()
     };
@@ -74,6 +74,13 @@ enum ObjectKind {
     Cube,
     PlyMesh,
     ObjMesh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum SceneEnvironment {
+    Empty,
+    CornellBox,
+    ObjFile,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -124,6 +131,23 @@ impl Default for BsdfNode {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct SceneEnvironmentConfig {
+    kind: SceneEnvironment,
+    obj_filename: String,
+    obj_scale: f32,
+}
+
+impl Default for SceneEnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            kind: SceneEnvironment::CornellBox,
+            obj_filename: "meshes/room.obj".to_string(),
+            obj_scale: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct ObjectConfig {
     enabled: bool,
     kind: ObjectKind,
@@ -151,6 +175,8 @@ struct CornellBoxConfig {
     film: FilmConfig,
     sampler: SamplerConfig,
     light: AreaLightConfig,
+    #[serde(default)]
+    scene_environment: SceneEnvironmentConfig,
     object: ObjectConfig,
 }
 
@@ -183,6 +209,7 @@ impl Default for CornellBoxConfig {
                 scale_xy: 0.35,
                 y: 1.99,
             },
+            scene_environment: SceneEnvironmentConfig::default(),
             object: ObjectConfig {
                 enabled: true,
                 translate: [0.0, 0.35, 0.0],
@@ -224,7 +251,7 @@ struct MitsubaStudioApp {
     job: RenderJobState,
     training_progress: Option<TrainingProgress>,
 
-    // --- Embedded preview image ---
+    // --- Embedded preview image (Training 2x2 grid) ---
     preview_path: String,
     preview_texture: Option<TextureHandle>,
     preview_error: String,
@@ -232,6 +259,12 @@ struct MitsubaStudioApp {
     preview_auto_refresh: bool,
     preview_refresh_interval_secs: f32,
     preview_last_refresh: Option<Instant>,
+
+    // --- Path tracing render output ---
+    pathtracing_path: String,
+    pathtracing_texture: Option<TextureHandle>,
+    pathtracing_error: String,
+    pathtracing_zoom: f32,
 
     // --- Persistence ---
     state_dirty: bool,
@@ -241,12 +274,14 @@ struct MitsubaStudioApp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarTab {
     Scene,
-    Render,
+    PathTracing,
+    Training,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTab {
-    Preview,
+    Training,
+    PathTracing,
     Log,
     Xml,
 }
@@ -266,10 +301,25 @@ struct PersistedState {
     fit_lr: f32,
     fit_out_dir: String,
 
+    // Training preview (2x2 grid: GT|Current / Diff|Params)
     preview_path: String,
     preview_zoom: f32,
     preview_auto_refresh: bool,
     preview_refresh_interval_secs: f32,
+
+    // Path tracing render output
+    #[serde(default = "default_pathtracing_path")]
+    pathtracing_path: String,
+    #[serde(default = "default_pathtracing_zoom")]
+    pathtracing_zoom: f32,
+}
+
+fn default_pathtracing_path() -> String {
+    "renders/preview.png".to_string()
+}
+
+fn default_pathtracing_zoom() -> f32 {
+    1.0
 }
 
 enum RenderJobState {
@@ -470,7 +520,7 @@ impl MitsubaStudioApp {
             xml_preview,
 
             sidebar_tab: SidebarTab::Scene,
-            main_tab: MainTab::Preview,
+            main_tab: MainTab::Training,
             style_applied: false,
 
             // Default paths assume `current_dir` will be the workspace root (we set it when spawning).
@@ -488,13 +538,18 @@ impl MitsubaStudioApp {
             job: RenderJobState::Idle,
             training_progress: None,
 
-            preview_path: "renders/preview.png".to_string(),
+            preview_path: "renders/fit/progress.png".to_string(),
             preview_texture: None,
             preview_error: "".to_string(),
             preview_zoom: 1.0,
             preview_auto_refresh: true,
             preview_refresh_interval_secs: 2.0,
             preview_last_refresh: None,
+
+            pathtracing_path: "renders/preview.png".to_string(),
+            pathtracing_texture: None,
+            pathtracing_error: "".to_string(),
+            pathtracing_zoom: 1.0,
 
             state_dirty: false,
             state_last_save: None,
@@ -546,6 +601,9 @@ impl MitsubaStudioApp {
         self.preview_auto_refresh = st.preview_auto_refresh;
         self.preview_refresh_interval_secs = st.preview_refresh_interval_secs;
 
+        self.pathtracing_path = st.pathtracing_path;
+        self.pathtracing_zoom = st.pathtracing_zoom;
+
         self.fit_steps = st.fit_steps;
         self.fit_lr = st.fit_lr;
         self.fit_out_dir = st.fit_out_dir;
@@ -585,6 +643,9 @@ impl MitsubaStudioApp {
             preview_zoom: self.preview_zoom,
             preview_auto_refresh: self.preview_auto_refresh,
             preview_refresh_interval_secs: self.preview_refresh_interval_secs,
+
+            pathtracing_path: self.pathtracing_path.clone(),
+            pathtracing_zoom: self.pathtracing_zoom,
         };
 
         let path = self.state_file_path();
@@ -659,6 +720,45 @@ impl MitsubaStudioApp {
             self.last_status = format!("Loaded preview: {}", path.display());
         }
         self.preview_last_refresh = Some(Instant::now());
+    }
+
+    fn load_pathtracing_texture(&mut self, ctx: &egui::Context, set_status: bool) {
+        let rel = self.pathtracing_path.trim();
+        if rel.is_empty() {
+            self.pathtracing_error = "Path tracing path is empty".to_string();
+            self.pathtracing_texture = None;
+            return;
+        }
+
+        let path = self.workspace_root().join(rel);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(err) => {
+                self.pathtracing_error = format!("Failed to read {}: {}", path.display(), err);
+                self.pathtracing_texture = None;
+                return;
+            }
+        };
+
+        let dyn_img = match image::load_from_memory(&bytes) {
+            Ok(img) => img,
+            Err(err) => {
+                self.pathtracing_error = format!("Failed to decode image: {}", err);
+                self.pathtracing_texture = None;
+                return;
+            }
+        };
+
+        let rgba = dyn_img.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+
+        self.pathtracing_texture =
+            Some(ctx.load_texture("pathtracing_png", color_image, egui::TextureOptions::LINEAR));
+        self.pathtracing_error.clear();
+        if set_status {
+            self.last_status = format!("Loaded path tracing: {}", path.display());
+        }
     }
 
     fn maybe_refresh_preview(&mut self, ctx: &egui::Context) {
@@ -875,12 +975,22 @@ impl eframe::App for MitsubaStudioApp {
 
             match rx.try_recv() {
                 Ok(result) => {
+                    let job_succeeded = result.ok;
                     self.last_status = if result.ok {
                         "Job finished successfully".to_string()
                     } else {
                         format!("Job failed (exit={:?})", result.exit_code)
                     };
                     self.job = RenderJobState::Finished(result);
+
+                    // Refresh appropriate image based on current tab
+                    if job_succeeded {
+                        match self.main_tab {
+                            MainTab::Training => self.load_preview_texture(ctx, false),
+                            MainTab::PathTracing => self.load_pathtracing_texture(ctx, false),
+                            _ => {}
+                        }
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // Request repaint for live log updates
@@ -915,6 +1025,10 @@ impl eframe::App for MitsubaStudioApp {
                             if ui.button("Render").clicked() {
                                 self.mark_state_dirty();
                                 if self.write_xml_to_scene_path() {
+                                    // Set pathtracing path to render output and switch to PathTracing tab
+                                    self.pathtracing_path = self.render_out_path.clone();
+                                    self.main_tab = MainTab::PathTracing;
+
                                     self.start_python_job(vec![
                                         "tools/mitsuba_render.py".to_string(),
                                         "--scene".to_string(),
@@ -932,12 +1046,16 @@ impl eframe::App for MitsubaStudioApp {
                             if ui.button("Diff Render").clicked() {
                                 self.mark_state_dirty();
                                 if self.write_xml_to_scene_path() {
+                                    // Set pathtracing path to render output and switch to PathTracing tab
+                                    self.pathtracing_path = self.render_out_path.clone();
+                                    self.main_tab = MainTab::PathTracing;
+
                                     self.start_python_job(vec![
                                         "tools/mitsuba_diff_smoketest.py".to_string(),
                                         "--scene".to_string(),
                                         self.render_scene_path.clone(),
                                         "--variant".to_string(),
-                                        "llvm_ad_rgb".to_string(),
+                                        "cuda_ad_rgb".to_string(),
                                         "--spp".to_string(),
                                         "4".to_string(),
                                     ]);
@@ -979,7 +1097,8 @@ impl eframe::App for MitsubaStudioApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Scene, "Scene");
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Render, "Render");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::PathTracing, "Path Tracing");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Training, "Training");
                 });
                 ui.separator();
 
@@ -1017,60 +1136,6 @@ impl eframe::App for MitsubaStudioApp {
                                         vec3_ui(ui, "up", &mut self.config.camera.up, -1.0..=1.0);
                                 });
 
-                            egui::CollapsingHeader::new("Film")
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    egui::Grid::new("film_grid")
-                                        .num_columns(2)
-                                        .spacing(egui::vec2(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.label("Width");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(
-                                                        &mut self.config.film.width,
-                                                    )
-                                                    .speed(1)
-                                                    .range(16..=8192),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Height");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(
-                                                        &mut self.config.film.height,
-                                                    )
-                                                    .speed(1)
-                                                    .range(16..=8192),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-                                        });
-                                });
-
-                            egui::CollapsingHeader::new("Sampler")
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    egui::Grid::new("sampler_grid")
-                                        .num_columns(2)
-                                        .spacing(egui::vec2(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.label("Sample count");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(
-                                                        &mut self.config.sampler.sample_count,
-                                                    )
-                                                    .speed(1)
-                                                    .range(1..=4096),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-                                        });
-                                });
-
                             egui::CollapsingHeader::new("Light")
                                 .default_open(true)
                                 .show(ui, |ui| {
@@ -1101,6 +1166,73 @@ impl eframe::App for MitsubaStudioApp {
                                                 .text("y"),
                                         )
                                         .changed();
+                                });
+
+                            egui::CollapsingHeader::new("Scene Environment")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Type");
+                                        egui::ComboBox::from_id_salt("scene_environment_kind")
+                                            .selected_text(match self.config.scene_environment.kind {
+                                                SceneEnvironment::Empty => "Empty",
+                                                SceneEnvironment::CornellBox => "Cornell Box",
+                                                SceneEnvironment::ObjFile => "OBJ File",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.scene_environment.kind,
+                                                        SceneEnvironment::Empty,
+                                                        "Empty",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.scene_environment.kind,
+                                                        SceneEnvironment::CornellBox,
+                                                        "Cornell Box",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.scene_environment.kind,
+                                                        SceneEnvironment::ObjFile,
+                                                        "OBJ File",
+                                                    )
+                                                    .changed();
+                                            });
+                                    });
+
+                                    if self.config.scene_environment.kind == SceneEnvironment::ObjFile {
+                                        ui.label("OBJ file (relative to scenes/)");
+                                        ui.horizontal(|ui| {
+                                            changed |= ui
+                                                .text_edit_singleline(&mut self.config.scene_environment.obj_filename)
+                                                .changed();
+                                            if ui.button("Browse").clicked() {
+                                                let picked = rfd::FileDialog::new()
+                                                    .add_filter("Wavefront OBJ", &["obj"])
+                                                    .pick_file();
+                                                if let Some(path) = picked {
+                                                    let ws = self.workspace_root();
+                                                    let s = path
+                                                        .strip_prefix(&ws)
+                                                        .ok()
+                                                        .map(|p| p.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| path.to_string_lossy().to_string());
+                                                    self.config.scene_environment.obj_filename = s;
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                        changed |= ui
+                                            .add(
+                                                egui::Slider::new(&mut self.config.scene_environment.obj_scale, 0.01..=10.0)
+                                                    .text("scale"),
+                                            )
+                                            .changed();
+                                    }
                                 });
 
                             egui::CollapsingHeader::new("Object")
@@ -1239,66 +1371,128 @@ impl eframe::App for MitsubaStudioApp {
                                         });
                                 });
                         }
-                        SidebarTab::Render => {
-                            ui.label("Runs Python scripts in the workspace root.");
+                        SidebarTab::PathTracing => {
+                            ui.label("Path tracing renderer settings (Mitsuba 3)");
                             ui.add_space(6.0);
 
-                            egui::Grid::new("render_grid")
-                                .num_columns(2)
-                                .spacing(egui::vec2(10.0, 8.0))
+                            egui::CollapsingHeader::new("Film")
+                                .default_open(true)
                                 .show(ui, |ui| {
-                                    ui.label("Python");
-                                    state_changed |=
-                                        ui.text_edit_singleline(&mut self.python_exe).changed();
-                                    ui.end_row();
+                                    egui::Grid::new("film_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Width");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.film.width,
+                                                    )
+                                                    .speed(1)
+                                                    .range(16..=8192),
+                                                )
+                                                .changed();
+                                            ui.end_row();
 
-                                    ui.label("Scene");
-                                    state_changed |= ui
-                                        .text_edit_singleline(&mut self.render_scene_path)
-                                        .changed();
-                                    ui.end_row();
-
-                                    ui.label("Variant");
-                                    state_changed |=
-                                        ui.text_edit_singleline(&mut self.render_variant).changed();
-                                    ui.end_row();
-
-                                    ui.label("SPP");
-                                    state_changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut self.render_spp)
-                                                .speed(1)
-                                                .range(1..=4096),
-                                        )
-                                        .changed();
-                                    ui.end_row();
-
-                                    ui.label("Output");
-                                    state_changed |= ui
-                                        .text_edit_singleline(&mut self.render_out_path)
-                                        .changed();
-                                    ui.end_row();
+                                            ui.label("Height");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.film.height,
+                                                    )
+                                                    .speed(1)
+                                                    .range(16..=8192),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+                                        });
                                 });
 
-                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new("Sampler")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("sampler_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Sample count (SPP)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.config.sampler.sample_count,
+                                                    )
+                                                    .speed(1)
+                                                    .range(1..=4096),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+                                        });
+                                });
+
+                            egui::CollapsingHeader::new("Render Settings")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("render_settings_grid")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(10.0, 8.0))
+                                        .show(ui, |ui| {
+                                            ui.label("Variant");
+                                            state_changed |=
+                                                ui.text_edit_singleline(&mut self.render_variant).changed();
+                                            ui.end_row();
+
+                                            ui.label("SPP (override)");
+                                            state_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut self.render_spp)
+                                                        .speed(1)
+                                                        .range(1..=4096),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Output path");
+                                            state_changed |= ui
+                                                .text_edit_singleline(&mut self.render_out_path)
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Scene path");
+                                            state_changed |= ui
+                                                .text_edit_singleline(&mut self.render_scene_path)
+                                                .changed();
+                                            ui.end_row();
+                                        });
+                                });
+
                             egui::CollapsingHeader::new("Advanced")
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    ui.label("macOS: DRJIT_LIBLLVM_PATH for llvm_ad_* variants");
+                                    ui.label("DRJIT_LIBLLVM_PATH for llvm_ad_* variants");
                                     state_changed |= ui
                                         .text_edit_singleline(&mut self.drjit_libllvm_path)
                                         .changed();
-                                    ui.label("Example: /opt/homebrew/opt/llvm/lib/libLLVM.dylib");
+                                    ui.label("Windows: C:\\Program Files\\LLVM\\bin\\LLVM-C.dll");
+                                    ui.label("macOS: /opt/homebrew/opt/llvm/lib/libLLVM.dylib");
+                                });
+                        }
+                        SidebarTab::Training => {
+                            ui.label("Material fitting with nvdiffrast (requires CUDA GPU)");
+                            ui.add_space(6.0);
+
+                            egui::Grid::new("python_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(10.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.label("Python exe");
+                                    state_changed |=
+                                        ui.text_edit_singleline(&mut self.python_exe).changed();
+                                    ui.end_row();
                                 });
 
-                            ui.add_space(8.0);
-                            egui::CollapsingHeader::new("Fit material (nvdiffrast)")
-                                .default_open(false)
+                            egui::CollapsingHeader::new("Training Parameters")
+                                .default_open(true)
                                 .show(ui, |ui| {
-                                    ui.label(
-                                        "Fits a differentiable raster approximation to Mitsuba ground truth. \
-Run on a CUDA machine (e.g. Windows + NVIDIA).",
-                                    );
 
                                     egui::Grid::new("fit_grid")
                                         .num_columns(2)
@@ -1335,10 +1529,17 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                                             if ui.button("Fit diffuse albedo").clicked() {
                                                 self.mark_state_dirty();
                                                 if self.write_xml_to_scene_path() {
+                                                    // Set preview path to show training progress
+                                                    self.preview_path = format!("{}/progress.png", self.fit_out_dir);
+                                                    self.preview_auto_refresh = true;
+                                                    self.preview_refresh_interval_secs = 1.0; // Refresh every second
+
                                                     self.start_python_job(vec![
                                                         "tools/mitsuba_raster_fit_nvdiffrast.py".to_string(),
                                                         "--scene".to_string(),
                                                         self.render_scene_path.clone(),
+                                                        "--gt-image".to_string(),
+                                                        self.pathtracing_path.clone(),
                                                         "--gt-variant".to_string(),
                                                         self.render_variant.clone(),
                                                         "--gt-spp".to_string(),
@@ -1356,10 +1557,17 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                                             if ui.button("Fit Disney BRDF").clicked() {
                                                 self.mark_state_dirty();
                                                 if self.write_xml_to_scene_path() {
+                                                    // Set preview path to show training progress
+                                                    self.preview_path = format!("{}_disney/progress.png", self.fit_out_dir);
+                                                    self.preview_auto_refresh = true;
+                                                    self.preview_refresh_interval_secs = 1.0; // Refresh every second
+
                                                     self.start_python_job(vec![
                                                         "tools/mitsuba_raster_fit_disney.py".to_string(),
                                                         "--scene".to_string(),
                                                         self.render_scene_path.clone(),
+                                                        "--gt-image".to_string(),
+                                                        self.pathtracing_path.clone(),
                                                         "--gt-variant".to_string(),
                                                         self.render_variant.clone(),
                                                         "--gt-spp".to_string(),
@@ -1400,16 +1608,17 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.main_tab, MainTab::Preview, "Preview");
+                ui.selectable_value(&mut self.main_tab, MainTab::Training, "Training");
+                ui.selectable_value(&mut self.main_tab, MainTab::PathTracing, "Path Tracing");
                 ui.selectable_value(&mut self.main_tab, MainTab::Log, "Log");
                 ui.selectable_value(&mut self.main_tab, MainTab::Xml, "XML");
             });
             ui.separator();
 
             match self.main_tab {
-                MainTab::Preview => {
+                MainTab::Training => {
                     ui.horizontal(|ui| {
-                        ui.label("Preview");
+                        ui.label("Training Progress (2x2 grid)");
                         ui.add_space(8.0);
                         ui.label("Path");
                         if ui
@@ -1421,8 +1630,8 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                         {
                             self.mark_state_dirty();
                         }
-                        if ui.button("Use output").clicked() {
-                            self.preview_path = self.render_out_path.clone();
+                        if ui.button("Use fit output").clicked() {
+                            self.preview_path = format!("{}/progress.png", self.fit_out_dir);
                             self.mark_state_dirty();
                         }
                         if ui.button("Reload").clicked() {
@@ -1506,6 +1715,91 @@ Run on a CUDA machine (e.g. Windows + NVIDIA).",
                             } else {
                                 ui.centered_and_justified(|ui| {
                                     ui.label(egui::RichText::new("No preview loaded").weak());
+                                });
+                            }
+                        });
+                    });
+                }
+                MainTab::PathTracing => {
+                    ui.horizontal(|ui| {
+                        ui.label("Path Tracing Render");
+                        ui.add_space(8.0);
+                        ui.label("Path");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.pathtracing_path)
+                                    .desired_width(260.0),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        if ui.button("Use render output").clicked() {
+                            self.pathtracing_path = self.render_out_path.clone();
+                            self.mark_state_dirty();
+                        }
+                        if ui.button("Reload").clicked() {
+                            self.load_pathtracing_texture(ctx, true);
+                        }
+                        ui.separator();
+                        ui.label("Zoom");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.pathtracing_zoom, 0.25..=2.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        ui.label(format!("{:.2}×", self.pathtracing_zoom));
+                    });
+                    ui.add_space(8.0);
+
+                    // First-time auto load
+                    if self.pathtracing_texture.is_none() && self.pathtracing_error.is_empty() {
+                        self.load_pathtracing_texture(ctx, false);
+                    }
+
+                    let available = ui.available_size();
+                    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+                    let frame = egui::Frame::canvas(ui.style())
+                        .rounding(egui::Rounding::same(12.0))
+                        .inner_margin(egui::Margin::same(12.0));
+                    frame.show(ui, |ui| {
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.set_min_size(rect.size());
+
+                            if let Some(tex) = &self.pathtracing_texture {
+                                // Fit using configured film aspect ratio
+                                let film_aspect = if self.config.film.width > 0 {
+                                    self.config.film.height as f32 / self.config.film.width as f32
+                                } else {
+                                    1.0
+                                };
+
+                                let max_w = ui.available_width().max(1.0);
+                                let max_h = ui.available_height().max(1.0);
+                                let mut w = max_w;
+                                let mut h = w * film_aspect;
+                                if h > max_h {
+                                    h = max_h;
+                                    w = (h / film_aspect).max(1.0);
+                                }
+
+                                ui.centered_and_justified(|ui| {
+                                    ui.image((
+                                        tex.id(),
+                                        egui::vec2(w * self.pathtracing_zoom, h * self.pathtracing_zoom),
+                                    ));
+                                });
+                            } else if !self.pathtracing_error.is_empty() {
+                                ui.centered_and_justified(|ui| {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, &self.pathtracing_error);
+                                });
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(egui::RichText::new("No render loaded").weak());
                                 });
                             }
                         });
@@ -2106,60 +2400,88 @@ fn generate_cbox_xml(cfg: &CornellBoxConfig) -> String {
     s.push_str("        </film>\n");
     s.push_str("    </sensor>\n\n");
 
-    // --- Cornell box: 5 walls (floor/ceiling/back/left/right) ---
-    // Floor
-    s.push_str("    <shape type=\"rectangle\">\n");
-    s.push_str("        <transform name=\"to_world\">\n");
-    s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"-90\"/>\n");
-    s.push_str("            <translate x=\"0\" y=\"0\" z=\"0\"/>\n");
-    s.push_str("        </transform>\n");
-    s.push_str("        <bsdf type=\"diffuse\">\n");
-    s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
-    s.push_str("        </bsdf>\n");
-    s.push_str("    </shape>\n\n");
+    // --- Scene Environment ---
+    match cfg.scene_environment.kind {
+        SceneEnvironment::Empty => {
+            // No environment geometry
+        }
+        SceneEnvironment::CornellBox => {
+            // --- Cornell box: 5 walls (floor/ceiling/back/left/right) ---
+            // Floor
+            s.push_str("    <shape type=\"rectangle\">\n");
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"-90\"/>\n");
+            s.push_str("            <translate x=\"0\" y=\"0\" z=\"0\"/>\n");
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
 
-    // Ceiling
-    s.push_str("    <shape type=\"rectangle\">\n");
-    s.push_str("        <transform name=\"to_world\">\n");
-    s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"90\"/>\n");
-    s.push_str("            <translate x=\"0\" y=\"2\" z=\"0\"/>\n");
-    s.push_str("        </transform>\n");
-    s.push_str("        <bsdf type=\"diffuse\">\n");
-    s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
-    s.push_str("        </bsdf>\n");
-    s.push_str("    </shape>\n\n");
+            // Ceiling
+            s.push_str("    <shape type=\"rectangle\">\n");
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"90\"/>\n");
+            s.push_str("            <translate x=\"0\" y=\"2\" z=\"0\"/>\n");
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
 
-    // Back wall
-    s.push_str("    <shape type=\"rectangle\">\n");
-    s.push_str("        <transform name=\"to_world\">\n");
-    s.push_str("            <translate x=\"0\" y=\"1\" z=\"-1\"/>\n");
-    s.push_str("        </transform>\n");
-    s.push_str("        <bsdf type=\"diffuse\">\n");
-    s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
-    s.push_str("        </bsdf>\n");
-    s.push_str("    </shape>\n\n");
+            // Back wall
+            s.push_str("    <shape type=\"rectangle\">\n");
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str("            <translate x=\"0\" y=\"1\" z=\"-1\"/>\n");
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
 
-    // Left wall (red)
-    s.push_str("    <shape type=\"rectangle\">\n");
-    s.push_str("        <transform name=\"to_world\">\n");
-    s.push_str("            <rotate x=\"0\" y=\"1\" z=\"0\" angle=\"90\"/>\n");
-    s.push_str("            <translate x=\"-1\" y=\"1\" z=\"0\"/>\n");
-    s.push_str("        </transform>\n");
-    s.push_str("        <bsdf type=\"diffuse\">\n");
-    s.push_str("            <rgb name=\"reflectance\" value=\"0.75, 0.15, 0.15\"/>\n");
-    s.push_str("        </bsdf>\n");
-    s.push_str("    </shape>\n\n");
+            // Left wall (red)
+            s.push_str("    <shape type=\"rectangle\">\n");
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str("            <rotate x=\"0\" y=\"1\" z=\"0\" angle=\"90\"/>\n");
+            s.push_str("            <translate x=\"-1\" y=\"1\" z=\"0\"/>\n");
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.75, 0.15, 0.15\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
 
-    // Right wall (green)
-    s.push_str("    <shape type=\"rectangle\">\n");
-    s.push_str("        <transform name=\"to_world\">\n");
-    s.push_str("            <rotate x=\"0\" y=\"1\" z=\"0\" angle=\"-90\"/>\n");
-    s.push_str("            <translate x=\"1\" y=\"1\" z=\"0\"/>\n");
-    s.push_str("        </transform>\n");
-    s.push_str("        <bsdf type=\"diffuse\">\n");
-    s.push_str("            <rgb name=\"reflectance\" value=\"0.15, 0.75, 0.15\"/>\n");
-    s.push_str("        </bsdf>\n");
-    s.push_str("    </shape>\n\n");
+            // Right wall (green)
+            s.push_str("    <shape type=\"rectangle\">\n");
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str("            <rotate x=\"0\" y=\"1\" z=\"0\" angle=\"-90\"/>\n");
+            s.push_str("            <translate x=\"1\" y=\"1\" z=\"0\"/>\n");
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.15, 0.75, 0.15\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
+        }
+        SceneEnvironment::ObjFile => {
+            // Load OBJ file as environment
+            s.push_str("    <shape type=\"obj\">\n");
+            s.push_str(&format!(
+                "        <string name=\"filename\" value=\"{}\"/>\n",
+                escape_xml_attr(&cfg.scene_environment.obj_filename)
+            ));
+            s.push_str("        <transform name=\"to_world\">\n");
+            s.push_str(&format!(
+                "            <scale x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+                cfg.scene_environment.obj_scale,
+                cfg.scene_environment.obj_scale,
+                cfg.scene_environment.obj_scale
+            ));
+            s.push_str("        </transform>\n");
+            s.push_str("        <bsdf type=\"diffuse\">\n");
+            s.push_str("            <rgb name=\"reflectance\" value=\"0.8, 0.8, 0.8\"/>\n");
+            s.push_str("        </bsdf>\n");
+            s.push_str("    </shape>\n\n");
+        }
+    }
 
     // Light
     if cfg.light.enabled {

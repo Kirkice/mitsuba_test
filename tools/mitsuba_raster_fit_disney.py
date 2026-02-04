@@ -86,7 +86,17 @@ class LightSpec:
     radiance: np.ndarray
 
 
-def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, list[LightSpec]]:
+@dataclass
+class WallSpec:
+    """Rectangle wall with transform and material"""
+    rotate_axis: np.ndarray  # (x, y, z)
+    rotate_angle: float      # degrees
+    translate: np.ndarray    # (x, y, z)
+    scale: np.ndarray        # (x, y, z)
+    reflectance: np.ndarray  # RGB color
+
+
+def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, list[LightSpec], list[WallSpec]]:
     import xml.etree.ElementTree as ET
 
     root = ET.parse(scene_path).getroot()
@@ -125,6 +135,65 @@ def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, list[LightSpe
             )
 
         lights.append(LightSpec(position=light_pos, radiance=light_rad))
+
+    # Parse all rectangle walls (skip those with emitters - they're lights)
+    walls = []
+    for shape in root.findall("./shape"):
+        if shape.attrib.get("type") != "rectangle":
+            continue
+        # Skip light rectangles
+        if shape.find("./emitter[@type='area']") is not None:
+            continue
+
+        # Parse transforms
+        transform = shape.find("./transform[@name='to_world']")
+        rotate_axis = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        rotate_angle = 0.0
+        translate = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        scale = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+
+        if transform is not None:
+            rot = transform.find("./rotate")
+            if rot is not None:
+                rotate_axis = np.array(
+                    [float(rot.attrib.get("x", 0.0)), float(rot.attrib.get("y", 0.0)), float(rot.attrib.get("z", 0.0))],
+                    dtype=np.float32,
+                )
+                rotate_angle = float(rot.attrib.get("angle", 0.0))
+
+            tr = transform.find("./translate")
+            if tr is not None:
+                translate = np.array(
+                    [float(tr.attrib.get("x", 0.0)), float(tr.attrib.get("y", 0.0)), float(tr.attrib.get("z", 0.0))],
+                    dtype=np.float32,
+                )
+
+            sc = transform.find("./scale")
+            if sc is not None:
+                if "value" in sc.attrib:
+                    v = float(sc.attrib["value"])
+                    scale = np.array([v, v, v], dtype=np.float32)
+                else:
+                    scale = np.array(
+                        [float(sc.attrib.get("x", 1.0)), float(sc.attrib.get("y", 1.0)), float(sc.attrib.get("z", 1.0))],
+                        dtype=np.float32,
+                    )
+
+        # Parse material reflectance
+        reflectance = np.array([0.8, 0.8, 0.8], dtype=np.float32)
+        bsdf = shape.find("./bsdf[@type='diffuse']")
+        if bsdf is not None:
+            rgb = bsdf.find("./rgb[@name='reflectance']")
+            if rgb is not None:
+                reflectance = _parse_vec3(rgb.attrib["value"])
+
+        walls.append(WallSpec(
+            rotate_axis=rotate_axis,
+            rotate_angle=rotate_angle,
+            translate=translate,
+            scale=scale,
+            reflectance=reflectance
+        ))
 
     # Object parsing (same as before)
     obj_kind = None
@@ -175,7 +244,7 @@ def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, list[LightSpe
     cam = Camera(origin=origin, target=target, up=up, fov_deg=fov, width=width, height=height)
     obj = ObjectSpec(kind=obj_kind, translate=translate, scale=scale, radius=radius, filename=filename)
 
-    return cam, obj, lights
+    return cam, obj, lights, walls
 
 
 def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -199,11 +268,52 @@ def perspective(fov_y_deg: float, aspect: float, z_near: float = 0.01, z_far: fl
     f = 1.0 / math.tan(math.radians(fov_y_deg) / 2.0)
     m = np.zeros((4, 4), dtype=np.float32)
     m[0, 0] = f / aspect
-    m[1, 1] = f
+    m[1, 1] = -f  # Flip Y to match image coordinates (top-left origin)
     m[2, 2] = (z_far + z_near) / (z_near - z_far)
     m[2, 3] = (2.0 * z_far * z_near) / (z_near - z_far)
     m[3, 2] = -1.0
     return m
+
+
+def rotation_matrix(axis: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Create a 3x3 rotation matrix around axis by angle (degrees)"""
+    angle = math.radians(angle_deg)
+    axis = axis / (np.linalg.norm(axis) + 1e-8)
+    x, y, z = axis
+    c = math.cos(angle)
+    s = math.sin(angle)
+    C = 1 - c
+
+    return np.array([
+        [x*x*C + c,   x*y*C - z*s, x*z*C + y*s],
+        [y*x*C + z*s, y*y*C + c,   y*z*C - x*s],
+        [z*x*C - y*s, z*y*C + x*s, z*z*C + c]
+    ], dtype=np.float32)
+
+
+def make_rectangle_mesh() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create a 2x2 rectangle in XY plane centered at origin, facing +Z"""
+    v = np.array([
+        [-1.0, -1.0, 0.0],
+        [ 1.0, -1.0, 0.0],
+        [ 1.0,  1.0, 0.0],
+        [-1.0,  1.0, 0.0],
+    ], dtype=np.float32)
+
+    f = np.array([
+        [0, 1, 2],
+        [0, 2, 3],
+    ], dtype=np.int32)
+
+    # Normals all point in +Z direction
+    n = np.array([
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+    return v, f, n
 
 
 def make_cube_mesh() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -262,6 +372,48 @@ def make_uv_sphere_mesh(radius: float, n_lat: int = 32, n_lon: int = 64) -> Tupl
 
     faces = np.array(faces, dtype=np.int32)
     return verts, faces, norms
+
+
+def transform_wall_mesh(wall: WallSpec) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generate and transform a rectangle wall mesh according to WallSpec"""
+    v, f, n = make_rectangle_mesh()
+
+    # Apply rotation if any
+    if np.linalg.norm(wall.rotate_axis) > 1e-6 and abs(wall.rotate_angle) > 1e-6:
+        rot_mat = rotation_matrix(wall.rotate_axis, wall.rotate_angle)
+        v = v @ rot_mat.T
+        n = n @ rot_mat.T
+
+    # Apply scale and translation
+    v = v * wall.scale.reshape(1, 3) + wall.translate.reshape(1, 3)
+
+    # Normalize normals
+    n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-8)
+
+    return v, f, n
+
+
+def combine_meshes(mesh_list: list[Tuple[np.ndarray, np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Combine multiple meshes into a single mesh"""
+    if not mesh_list:
+        raise ValueError("No meshes to combine")
+
+    all_verts = []
+    all_faces = []
+    all_norms = []
+    vertex_offset = 0
+
+    for v, f, n in mesh_list:
+        all_verts.append(v)
+        all_faces.append(f + vertex_offset)
+        all_norms.append(n)
+        vertex_offset += len(v)
+
+    combined_verts = np.vstack(all_verts)
+    combined_faces = np.vstack(all_faces)
+    combined_norms = np.vstack(all_norms)
+
+    return combined_verts, combined_faces, combined_norms
 
 
 def load_mesh_any(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -432,8 +584,9 @@ def geometric_smith_ggx(ndotl, ndotv, roughness, eps=1e-8):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True, help="Mitsuba XML scene path")
+    ap.add_argument("--gt-image", type=str, help="Ground truth image path (if provided, skip rendering)")
     ap.add_argument("--gt-variant", default="scalar_rgb", help="Mitsuba variant for ground truth")
-    ap.add_argument("--gt-spp", type=int, default=256, help="SPP for ground truth")
+    ap.add_argument("--gt-spp", type=int, default=256, help="SPP for ground truth (only if --gt-image not provided)")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--lr", type=float, default=0.01)
     ap.add_argument("--out-dir", default="renders/fit_disney", help="Output directory")
@@ -473,9 +626,21 @@ def main() -> int:
     except Exception:
         pass
 
-    print(f"Rendering ground truth with {args.gt_spp} spp...")
-    img_gt = mi.render(scene, spp=args.gt_spp)
-    img_gt_np = np.array(img_gt, dtype=np.float32).reshape(height, width, 3)
+    # Load or render ground truth
+    if args.gt_image:
+        gt_path = Path(args.gt_image)
+        if not gt_path.is_absolute():
+            gt_path = ws / gt_path
+        print(f"Loading ground truth from: {gt_path}")
+        from PIL import Image
+        img_gt_pil = Image.open(gt_path).convert("RGB")
+        img_gt_np = np.array(img_gt_pil, dtype=np.float32) / 255.0
+        if img_gt_np.shape[:2] != (height, width):
+            print(f"Warning: GT image size {img_gt_np.shape[:2]} != film size ({height}, {width})")
+    else:
+        print(f"Rendering ground truth with {args.gt_spp} spp...")
+        img_gt = mi.render(scene, spp=args.gt_spp)
+        img_gt_np = np.array(img_gt, dtype=np.float32).reshape(height, width, 3)
 
     # Torch + nvdiffrast
     torch = _require("torch")
@@ -493,28 +658,51 @@ def main() -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    cam, obj, lights = parse_scene_xml(scene_path)
+    cam, obj, lights, walls = parse_scene_xml(scene_path)
 
-    print(f"Parsed {len(lights)} light(s) from scene")
+    print(f"Parsed {len(lights)} light(s) and {len(walls)} wall(s) from scene")
 
     # Load/build object mesh
     if obj.kind == "sphere":
-        v, f, n = make_uv_sphere_mesh(radius=obj.radius)
+        v_obj, f_obj, n_obj = make_uv_sphere_mesh(radius=obj.radius)
     elif obj.kind == "cube":
-        v, f, n = make_cube_mesh()
+        v_obj, f_obj, n_obj = make_cube_mesh()
     else:
         mesh_path = Path(obj.filename)
         if not mesh_path.is_absolute():
             mesh_path = scene_path.parent / mesh_path
-        v, f, n = load_mesh_any(mesh_path)
+        v_obj, f_obj, n_obj = load_mesh_any(mesh_path)
 
-    v = v * obj.scale.reshape(1, 3) + obj.translate.reshape(1, 3)
+    # Transform object mesh
+    v_obj = v_obj * obj.scale.reshape(1, 3) + obj.translate.reshape(1, 3)
+
+    # Generate wall meshes and track vertex colors
+    meshes_to_combine = [(v_obj, f_obj, n_obj)]
+    vertex_colors = []  # Store base color per vertex
+
+    # Object vertices will use optimized material (mark with special color for now)
+    # We'll use -1 to indicate "use optimized color"
+    obj_colors = np.full((len(v_obj), 3), -1.0, dtype=np.float32)
+    vertex_colors.append(obj_colors)
+
+    for wall in walls:
+        v_wall, f_wall, n_wall = transform_wall_mesh(wall)
+        meshes_to_combine.append((v_wall, f_wall, n_wall))
+
+        # Wall vertices use fixed reflectance colors
+        wall_colors = np.tile(wall.reflectance.reshape(1, 3), (len(v_wall), 1))
+        vertex_colors.append(wall_colors)
+
+    # Combine all meshes into single scene mesh
+    v, f, n = combine_meshes(meshes_to_combine)
+    vertex_base_colors = np.vstack(vertex_colors)
 
     device = torch.device(args.device)
 
     v_t = torch.from_numpy(v).to(device=device, dtype=torch.float32)
     n_t = torch.from_numpy(n).to(device=device, dtype=torch.float32)
     f_t = torch.from_numpy(f).to(device=device, dtype=torch.int32)
+    vertex_base_colors_t = torch.from_numpy(vertex_base_colors).to(device=device, dtype=torch.float32)
 
     # Camera matrices
     aspect = cam.width / max(1.0, float(cam.height))
@@ -534,24 +722,32 @@ def main() -> int:
     if init_base_color.shape[0] != 3:
         raise ValueError("--init-base-color must have 3 values")
 
+    # Helper function to safely compute logit transform
+    def safe_logit(value, eps=1e-6):
+        """Compute logit while clamping input to safe range [eps, 1-eps]"""
+        clamped = max(eps, min(1.0 - eps, value))
+        return math.log(clamped / (1.0 - clamped))
+
     # Material parameters (logit parameterization for bounded values)
+    # Clamp base_color to safe range
+    init_base_color_safe = np.clip(init_base_color, 1e-6, 1.0 - 1e-6)
     base_color_logit = torch.from_numpy(
-        np.log(init_base_color / (1.0 - init_base_color + 1e-8))
+        np.log(init_base_color_safe / (1.0 - init_base_color_safe))
     ).to(device=device, dtype=torch.float32)
     base_color_logit.requires_grad = True
 
     roughness_logit = torch.tensor(
-        [math.log(args.init_roughness / (1.0 - args.init_roughness + 1e-8))],
+        [safe_logit(args.init_roughness)],
         device=device, dtype=torch.float32, requires_grad=True
     )
 
     metallic_logit = torch.tensor(
-        [math.log(args.init_metallic / (1.0 - args.init_metallic + 1e-8))],
+        [safe_logit(args.init_metallic)],
         device=device, dtype=torch.float32, requires_grad=True
     )
 
     specular_logit = torch.tensor(
-        [math.log(args.init_specular / (1.0 - args.init_specular + 1e-8))],
+        [safe_logit(args.init_specular)],
         device=device, dtype=torch.float32, requires_grad=True
     )
 
@@ -563,35 +759,62 @@ def main() -> int:
     # Camera position for view vector
     cam_pos_t = torch.from_numpy(cam.origin).to(device=device, dtype=torch.float32)
 
-    # Lights to torch
-    lights_pos = []
-    lights_rad = []
+    # Create area light samples (simulate area light as multiple point samples)
+    # Cornell Box light is 0.35x0.35 square at y=1.99
+    area_light_samples = []
+    area_light_radiance = []
     for light in lights:
-        lights_pos.append(torch.from_numpy(light.position).to(device=device, dtype=torch.float32))
-        lights_rad.append(torch.from_numpy(light.radiance).to(device=device, dtype=torch.float32))
+        # Sample the area light with a grid (5x5 samples)
+        light_size = 0.35  # Cornell Box light size
+        num_samples = 5
+        base_pos = light.position
+
+        for i in range(num_samples):
+            for j in range(num_samples):
+                # Offset from center (-0.5 to +0.5) * light_size
+                offset_x = (i / (num_samples - 1) - 0.5) * light_size
+                offset_z = (j / (num_samples - 1) - 0.5) * light_size
+                sample_pos = base_pos + np.array([offset_x, 0.0, offset_z], dtype=np.float32)
+                area_light_samples.append(torch.from_numpy(sample_pos).to(device=device, dtype=torch.float32))
+                # Divide radiance by number of samples to conserve energy
+                area_light_radiance.append(torch.from_numpy(light.radiance / (num_samples * num_samples)).to(device=device, dtype=torch.float32))
 
     # Raster context
     ctx = drt.RasterizeGLContext()
 
-    # Ambient light (simple environment approximation)
-    ambient_color = torch.tensor([0.05, 0.05, 0.05], device=device, dtype=torch.float32)
+    # Increase ambient light to approximate indirect illumination from colored walls
+    ambient_color = torch.tensor([0.15, 0.15, 0.15], device=device, dtype=torch.float32)
 
     def render_raster(base_color, roughness, metallic, specular):
         rast, _ = drt.rasterize(ctx, v_clip[None, ...], f_t, (height, width))
         mask = rast[..., 3:4] > 0
 
-        # Interpolate world position and normals
+        # Interpolate world position, normals, and vertex colors
         pos, _ = drt.interpolate(v_t[None, ...], rast, f_t)
         nor, _ = drt.interpolate(n_t[None, ...], rast, f_t)
         nor = torch.nn.functional.normalize(nor, dim=-1)
 
+        # Interpolate per-vertex base colors
+        vertex_colors, _ = drt.interpolate(vertex_base_colors_t[None, ...], rast, f_t)
+
+        # For object vertices (marked with negative values), use optimized base_color
+        # For wall vertices, use their fixed colors
+        is_object = vertex_colors[..., 0:1] < 0
+        per_pixel_base_color = torch.where(is_object, base_color[None, None, None, :], vertex_colors)
+
+        # For walls, use simple diffuse material (metallic=0, high roughness)
+        # For object, use optimized material
+        per_pixel_roughness = torch.where(is_object, roughness[None, None, None, :], torch.ones_like(roughness[None, None, None, :]))
+        per_pixel_metallic = torch.where(is_object, metallic[None, None, None, :], torch.zeros_like(metallic[None, None, None, :]))
+        per_pixel_specular = torch.where(is_object, specular[None, None, None, :], torch.ones_like(specular[None, None, None, :]) * 0.5)
+
         # View direction
         view_dir = torch.nn.functional.normalize(cam_pos_t[None, None, None, :] - pos, dim=-1)
 
-        # Accumulate lighting from all lights
+        # Accumulate lighting from all area light samples
         col = torch.zeros_like(pos)
 
-        for light_pos, light_rad in zip(lights_pos, lights_rad):
+        for light_pos, light_rad in zip(area_light_samples, area_light_radiance):
             # Light direction and distance
             l_vec = light_pos[None, None, None, :] - pos
             dist2 = torch.sum(l_vec * l_vec, dim=-1, keepdim=True).clamp_min(1e-4)
@@ -600,13 +823,13 @@ def main() -> int:
             # Half vector
             h = torch.nn.functional.normalize(l_dir + view_dir, dim=-1)
 
-            # Evaluate Disney BRDF
+            # Evaluate Disney BRDF with per-pixel materials
             brdf = disney_brdf(
                 nor, l_dir, view_dir, h,
-                base_color[None, None, None, :],
-                roughness[None, None, None, :],
-                metallic[None, None, None, :],
-                specular[None, None, None, :]
+                per_pixel_base_color,
+                per_pixel_roughness,
+                per_pixel_metallic,
+                per_pixel_specular
             )
 
             # Lighting equation
@@ -615,7 +838,7 @@ def main() -> int:
             col = col + light_contrib
 
         # Add ambient lighting (very simple approximation)
-        col = col + base_color[None, None, None, :] * ambient_color[None, None, None, :] * (1.0 - metallic[None, None, None, :])
+        col = col + per_pixel_base_color * ambient_color[None, None, None, :] * (1.0 - per_pixel_metallic)
 
         # Background = 0
         col = torch.where(mask, col, torch.zeros_like(col))
@@ -629,6 +852,9 @@ def main() -> int:
     print(f"  roughness: {args.init_roughness:.3f}")
     print(f"  metallic: {args.init_metallic:.3f}")
     print(f"  specular: {args.init_specular:.3f}\n")
+
+    # Prepare progress preview path for GUI
+    progress_preview_path = out_dir / "progress.png"
 
     for step in range(args.steps):
         opt.zero_grad(set_to_none=True)
@@ -663,6 +889,72 @@ def main() -> int:
                 print(f"step={step:04d} loss={loss.item():.6f} "
                       f"baseColor=[{bc[0]:.6f} {bc[1]:.6f} {bc[2]:.6f}] "
                       f"roughness={r:.6f} metallic={m_val:.6f} specular={s:.6f}")
+
+                # Save progress preview for GUI (2x2 grid layout)
+                pred_np = pred.detach().cpu().numpy().astype(np.float32)
+                pred_clipped = np.clip(pred_np, 0.0, 1.0)
+                gt_clipped = np.clip(img_gt_np, 0.0, 1.0)
+                diff = np.clip(np.abs(gt_clipped - pred_clipped) * 3.0, 0.0, 1.0)
+
+                # Create 2x2 grid: [GT | Current]
+                #                  [Diff | Info  ]
+                h, w = gt_clipped.shape[:2]
+                canvas = np.zeros((h * 2, w * 2, 3), dtype=np.float32)
+
+                # Top row: GT | Current
+                canvas[:h, :w, :] = gt_clipped
+                canvas[:h, w:, :] = pred_clipped
+
+                # Bottom left: Diff
+                canvas[h:, :w, :] = diff
+
+                # Bottom right: Info panel
+                canvas[h:, w:, :] = np.ones((h, w, 3), dtype=np.float32) * 0.1
+
+                # Add text labels
+                try:
+                    from PIL import Image, ImageDraw, ImageFont
+                    img_pil = Image.fromarray((canvas * 255).astype(np.uint8))
+                    draw = ImageDraw.Draw(img_pil)
+
+                    # Use default font
+                    try:
+                        font_large = ImageFont.truetype("arial.ttf", 24)
+                        font_small = ImageFont.truetype("arial.ttf", 18)
+                    except:
+                        font_large = ImageFont.load_default()
+                        font_small = font_large
+
+                    # Draw labels on top row
+                    draw.text((10, 10), "Ground Truth", fill=(255, 255, 0), font=font_large)
+                    draw.text((w + 10, 10), f"Current (Step {step}/{args.steps})", fill=(255, 255, 0), font=font_large)
+
+                    # Draw label on bottom left
+                    draw.text((10, h + 10), "Difference x3", fill=(255, 255, 0), font=font_large)
+
+                    # Draw parameters on bottom right
+                    draw.text((w + 10, h + 10), "Parameters:", fill=(255, 255, 255), font=font_large)
+                    y_offset = h + 45
+                    draw.text((w + 10, y_offset), f"Loss: {loss.item():.6f}", fill=(255, 200, 200), font=font_small)
+                    y_offset += 25
+                    draw.text((w + 10, y_offset), f"Base Color:", fill=(200, 200, 255), font=font_small)
+                    y_offset += 20
+                    draw.text((w + 20, y_offset), f"  R: {bc[0]:.3f}", fill=(255, 150, 150), font=font_small)
+                    y_offset += 20
+                    draw.text((w + 20, y_offset), f"  G: {bc[1]:.3f}", fill=(150, 255, 150), font=font_small)
+                    y_offset += 20
+                    draw.text((w + 20, y_offset), f"  B: {bc[2]:.3f}", fill=(150, 150, 255), font=font_small)
+                    y_offset += 25
+                    draw.text((w + 10, y_offset), f"Roughness: {r:.3f}", fill=(200, 200, 255), font=font_small)
+                    y_offset += 20
+                    draw.text((w + 10, y_offset), f"Metallic: {m_val:.3f}", fill=(200, 200, 255), font=font_small)
+                    y_offset += 20
+                    draw.text((w + 10, y_offset), f"Specular: {s:.3f}", fill=(200, 200, 255), font=font_small)
+
+                    img_pil.save(str(progress_preview_path))
+                except Exception as e:
+                    # Fallback: save without labels
+                    save_image_u8(progress_preview_path, canvas)
 
     # Final render and save
     with torch.no_grad():
