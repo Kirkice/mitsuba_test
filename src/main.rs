@@ -60,12 +60,64 @@ struct SamplerConfig {
     sample_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum LightType {
+    Area,
+    Point,
+    Spot,
+    Directional,
+    Envmap,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-struct AreaLightConfig {
+struct LightConfig {
     enabled: bool,
+    light_type: LightType,
+
+    // Common
     radiance_rgb: [f32; 3],
-    scale_xy: f32,
-    y: f32,
+
+    // Area light specific
+    area_scale_xy: f32,
+    area_y: f32,
+
+    // Point light specific
+    point_position: [f32; 3],
+
+    // Spot light specific
+    spot_position: [f32; 3],
+    spot_target: [f32; 3],
+    spot_cutoff_angle: f32,
+    spot_beam_width: f32,
+
+    // Directional light specific
+    directional_direction: [f32; 3],
+
+    // Envmap specific
+    envmap_filename: String,
+    envmap_scale: f32,
+    envmap_rotation: f32,  // Rotation in degrees (0-360)
+}
+
+impl Default for LightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            light_type: LightType::Area,
+            radiance_rgb: [18.0, 18.0, 18.0],
+            area_scale_xy: 0.35,
+            area_y: 1.99,
+            point_position: [0.0, 1.5, 0.0],
+            spot_position: [0.0, 2.0, 0.0],
+            spot_target: [0.0, 0.0, 0.0],
+            spot_cutoff_angle: 30.0,
+            spot_beam_width: 20.0,
+            directional_direction: [0.0, -1.0, 0.0],
+            envmap_filename: "textures/envmap.exr".to_string(),
+            envmap_scale: 1.0,
+            envmap_rotation: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +182,54 @@ impl Default for BsdfNode {
     }
 }
 
+/// Disney BRDF material parameter with differentiability flag
+#[derive(Clone, Serialize, Deserialize)]
+struct DisneyParam<T> {
+    value: T,
+    differentiable: bool,
+}
+
+impl<T> DisneyParam<T> {
+    fn new(value: T, differentiable: bool) -> Self {
+        Self {
+            value,
+            differentiable,
+        }
+    }
+}
+
+/// Disney Principled BRDF material configuration
+#[derive(Clone, Serialize, Deserialize)]
+struct DisneyMaterialConfig {
+    base_color: DisneyParam<[f32; 3]>,
+    metallic: DisneyParam<f32>,
+    roughness: DisneyParam<f32>,
+    specular: DisneyParam<f32>,
+    specular_tint: DisneyParam<f32>,
+    anisotropic: DisneyParam<f32>,
+    sheen: DisneyParam<f32>,
+    sheen_tint: DisneyParam<f32>,
+    clearcoat: DisneyParam<f32>,
+    clearcoat_gloss: DisneyParam<f32>,
+}
+
+impl Default for DisneyMaterialConfig {
+    fn default() -> Self {
+        Self {
+            base_color: DisneyParam::new([0.8, 0.8, 0.8], true),
+            metallic: DisneyParam::new(0.0, false),
+            roughness: DisneyParam::new(0.5, true),
+            specular: DisneyParam::new(0.5, false),
+            specular_tint: DisneyParam::new(0.0, false),
+            anisotropic: DisneyParam::new(0.0, false),
+            sheen: DisneyParam::new(0.0, false),
+            sheen_tint: DisneyParam::new(0.5, false),
+            clearcoat: DisneyParam::new(0.0, false),
+            clearcoat_gloss: DisneyParam::new(1.0, false),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SceneEnvironmentConfig {
     kind: SceneEnvironment,
@@ -174,10 +274,12 @@ struct CornellBoxConfig {
     camera: CameraConfig,
     film: FilmConfig,
     sampler: SamplerConfig,
-    light: AreaLightConfig,
+    light: LightConfig,
     #[serde(default)]
     scene_environment: SceneEnvironmentConfig,
     object: ObjectConfig,
+    #[serde(default)]
+    disney_material: DisneyMaterialConfig,
 }
 
 impl Default for CornellBoxConfig {
@@ -203,12 +305,7 @@ impl Default for CornellBoxConfig {
                 height: 512,
             },
             sampler: SamplerConfig { sample_count: 16 },
-            light: AreaLightConfig {
-                enabled: true,
-                radiance_rgb: [18.0, 18.0, 18.0],
-                scale_xy: 0.35,
-                y: 1.99,
-            },
+            light: LightConfig::default(),
             scene_environment: SceneEnvironmentConfig::default(),
             object: ObjectConfig {
                 enabled: true,
@@ -221,6 +318,7 @@ impl Default for CornellBoxConfig {
                 obj_filename: "meshes/teapot.obj".to_string(),
                 mesh_scale: 1.0,
             },
+            disney_material: DisneyMaterialConfig::default(),
         }
     }
 }
@@ -247,6 +345,7 @@ struct MitsubaStudioApp {
     fit_steps: u32,
     fit_lr: f32,
     fit_out_dir: String,
+    ibl_samples: u32,
 
     job: RenderJobState,
     training_progress: Option<TrainingProgress>,
@@ -534,6 +633,7 @@ impl MitsubaStudioApp {
             fit_steps: 400,
             fit_lr: 0.05,
             fit_out_dir: "renders/fit".to_string(),
+            ibl_samples: 128,
 
             job: RenderJobState::Idle,
             training_progress: None,
@@ -1140,32 +1240,167 @@ impl eframe::App for MitsubaStudioApp {
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     changed |= ui
-                                        .checkbox(
-                                            &mut self.config.light.enabled,
-                                            "Enable ceiling area light",
-                                        )
+                                        .checkbox(&mut self.config.light.enabled, "Enable light")
                                         .changed();
-                                    changed |= color3_ui(
-                                        ui,
-                                        "radiance",
-                                        &mut self.config.light.radiance_rgb,
-                                        0.0..=200.0,
-                                    );
-                                    changed |= ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut self.config.light.scale_xy,
-                                                0.05..=1.0,
-                                            )
-                                            .text("scale_xy"),
-                                        )
-                                        .changed();
-                                    changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut self.config.light.y, 0.5..=3.0)
-                                                .text("y"),
-                                        )
-                                        .changed();
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Type");
+                                        egui::ComboBox::from_id_salt("light_type")
+                                            .selected_text(match self.config.light.light_type {
+                                                LightType::Area => "Area Light",
+                                                LightType::Point => "Point Light",
+                                                LightType::Spot => "Spot Light",
+                                                LightType::Directional => "Directional Light",
+                                                LightType::Envmap => "Environment Map",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.light.light_type,
+                                                        LightType::Area,
+                                                        "Area Light",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.light.light_type,
+                                                        LightType::Point,
+                                                        "Point Light",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.light.light_type,
+                                                        LightType::Spot,
+                                                        "Spot Light",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.light.light_type,
+                                                        LightType::Directional,
+                                                        "Directional Light",
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut self.config.light.light_type,
+                                                        LightType::Envmap,
+                                                        "Environment Map",
+                                                    )
+                                                    .changed();
+                                            });
+                                    });
+
+                                    // Common radiance (except for envmap which uses scale)
+                                    if self.config.light.light_type != LightType::Envmap {
+                                        changed |= color3_ui(
+                                            ui,
+                                            "radiance",
+                                            &mut self.config.light.radiance_rgb,
+                                            0.0..=200.0,
+                                        );
+                                    }
+
+                                    // Type-specific parameters
+                                    match self.config.light.light_type {
+                                        LightType::Area => {
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.area_scale_xy,
+                                                        0.05..=1.0,
+                                                    )
+                                                    .text("scale_xy"),
+                                                )
+                                                .changed();
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.area_y,
+                                                        0.5..=3.0,
+                                                    )
+                                                    .text("y"),
+                                                )
+                                                .changed();
+                                        }
+                                        LightType::Point => {
+                                            changed |= vec3_ui(
+                                                ui,
+                                                "position",
+                                                &mut self.config.light.point_position,
+                                                -5.0..=5.0,
+                                            );
+                                        }
+                                        LightType::Spot => {
+                                            changed |= vec3_ui(
+                                                ui,
+                                                "position",
+                                                &mut self.config.light.spot_position,
+                                                -5.0..=5.0,
+                                            );
+                                            changed |= vec3_ui(
+                                                ui,
+                                                "target",
+                                                &mut self.config.light.spot_target,
+                                                -5.0..=5.0,
+                                            );
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.spot_cutoff_angle,
+                                                        5.0..=90.0,
+                                                    )
+                                                    .text("cutoff angle"),
+                                                )
+                                                .changed();
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.spot_beam_width,
+                                                        1.0..=90.0,
+                                                    )
+                                                    .text("beam width"),
+                                                )
+                                                .changed();
+                                        }
+                                        LightType::Directional => {
+                                            changed |= vec3_ui(
+                                                ui,
+                                                "direction",
+                                                &mut self.config.light.directional_direction,
+                                                -1.0..=1.0,
+                                            );
+                                        }
+                                        LightType::Envmap => {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Filename");
+                                                changed |= ui
+                                                    .text_edit_singleline(
+                                                        &mut self.config.light.envmap_filename,
+                                                    )
+                                                    .changed();
+                                            });
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.envmap_scale,
+                                                        0.0..=10.0,
+                                                    )
+                                                    .text("scale"),
+                                                )
+                                                .changed();
+                                            changed |= ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut self.config.light.envmap_rotation,
+                                                        0.0..=360.0,
+                                                    )
+                                                    .text("rotation (deg)"),
+                                                )
+                                                .changed();
+                                        }
+                                    }
                                 });
 
                             egui::CollapsingHeader::new("Scene Environment")
@@ -1369,6 +1604,172 @@ impl eframe::App for MitsubaStudioApp {
                                                 0,
                                             );
                                         });
+
+                                    ui.add_space(10.0);
+                                    egui::CollapsingHeader::new("Disney Material (Rasterization)")
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.label("These parameters are used for GPU rasterization-based training.");
+                                            ui.label("Toggle 'Diff' to enable gradient optimization for each parameter.");
+                                            ui.add_space(6.0);
+
+                                            // Base Color
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.base_color.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= color3_ui(
+                                                    ui,
+                                                    "base_color",
+                                                    &mut self.config.disney_material.base_color.value,
+                                                    0.0..=1.0,
+                                                );
+                                            });
+
+                                            // Metallic
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.metallic.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.metallic.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("metallic"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Roughness
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.roughness.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.roughness.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("roughness"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Specular
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.specular.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.specular.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("specular"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Specular Tint
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.specular_tint.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.specular_tint.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("specular_tint"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Anisotropic
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.anisotropic.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.anisotropic.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("anisotropic"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Sheen
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.sheen.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.sheen.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("sheen"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Sheen Tint
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.sheen_tint.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.sheen_tint.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("sheen_tint"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Clearcoat
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.clearcoat.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.clearcoat.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("clearcoat"),
+                                                    )
+                                                    .changed();
+                                            });
+
+                                            // Clearcoat Gloss
+                                            ui.horizontal(|ui| {
+                                                changed |= ui
+                                                    .checkbox(&mut self.config.disney_material.clearcoat_gloss.differentiable, "Diff")
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut self.config.disney_material.clearcoat_gloss.value,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("clearcoat_gloss"),
+                                                    )
+                                                    .changed();
+                                            });
+                                        });
                                 });
                         }
                         SidebarTab::PathTracing => {
@@ -1521,6 +1922,16 @@ impl eframe::App for MitsubaStudioApp {
                                             ui.label("Out dir");
                                             state_changed |= ui.text_edit_singleline(&mut self.fit_out_dir).changed();
                                             ui.end_row();
+
+                                            ui.label("IBL Samples");
+                                            state_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut self.ibl_samples)
+                                                        .speed(1)
+                                                        .range(1..=1024),
+                                                )
+                                                .changed();
+                                            ui.end_row();
                                         });
 
                                     ui.add_space(8.0);
@@ -1550,6 +1961,10 @@ impl eframe::App for MitsubaStudioApp {
                                                         self.fit_lr.to_string(),
                                                         "--out-dir".to_string(),
                                                         self.fit_out_dir.clone(),
+                                                        "--ibl-samples".to_string(),
+                                                        self.ibl_samples.to_string(),
+                                                        "--config".to_string(),
+                                                        ".mitsuba_studio_state.json".to_string(),
                                                     ]);
                                                 }
                                             }
@@ -1578,6 +1993,10 @@ impl eframe::App for MitsubaStudioApp {
                                                         self.fit_lr.to_string(),
                                                         "--out-dir".to_string(),
                                                         format!("{}_disney", self.fit_out_dir),
+                                                        "--ibl-samples".to_string(),
+                                                        self.ibl_samples.to_string(),
+                                                        "--config".to_string(),
+                                                        ".mitsuba_studio_state.json".to_string(),
                                                     ]);
                                                 }
                                             }
@@ -2485,25 +2904,93 @@ fn generate_cbox_xml(cfg: &CornellBoxConfig) -> String {
 
     // Light
     if cfg.light.enabled {
-        s.push_str("    <shape type=\"rectangle\">\n");
-        s.push_str("        <transform name=\"to_world\">\n");
-        s.push_str(&format!(
-            "            <scale x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
-            cfg.light.scale_xy, cfg.light.scale_xy, cfg.light.scale_xy
-        ));
-        s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"90\"/>\n");
-        s.push_str(&format!(
-            "            <translate x=\"0\" y=\"{}\" z=\"0\"/>\n",
-            cfg.light.y
-        ));
-        s.push_str("        </transform>\n");
-        s.push_str("        <emitter type=\"area\">\n");
-        s.push_str(&format!(
-            "            <rgb name=\"radiance\" value=\"{}, {}, {}\"/>\n",
-            cfg.light.radiance_rgb[0], cfg.light.radiance_rgb[1], cfg.light.radiance_rgb[2]
-        ));
-        s.push_str("        </emitter>\n");
-        s.push_str("    </shape>\n\n");
+        match cfg.light.light_type {
+            LightType::Area => {
+                s.push_str("    <shape type=\"rectangle\">\n");
+                s.push_str("        <transform name=\"to_world\">\n");
+                s.push_str(&format!(
+                    "            <scale x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+                    cfg.light.area_scale_xy, cfg.light.area_scale_xy, cfg.light.area_scale_xy
+                ));
+                s.push_str("            <rotate x=\"1\" y=\"0\" z=\"0\" angle=\"90\"/>\n");
+                s.push_str(&format!(
+                    "            <translate x=\"0\" y=\"{}\" z=\"0\"/>\n",
+                    cfg.light.area_y
+                ));
+                s.push_str("        </transform>\n");
+                s.push_str("        <emitter type=\"area\">\n");
+                s.push_str(&format!(
+                    "            <rgb name=\"radiance\" value=\"{}, {}, {}\"/>\n",
+                    cfg.light.radiance_rgb[0], cfg.light.radiance_rgb[1], cfg.light.radiance_rgb[2]
+                ));
+                s.push_str("        </emitter>\n");
+                s.push_str("    </shape>\n\n");
+            }
+            LightType::Point => {
+                s.push_str("    <emitter type=\"point\">\n");
+                s.push_str(&format!(
+                    "        <point name=\"position\" x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+                    cfg.light.point_position[0],
+                    cfg.light.point_position[1],
+                    cfg.light.point_position[2]
+                ));
+                s.push_str(&format!(
+                    "        <rgb name=\"intensity\" value=\"{}, {}, {}\"/>\n",
+                    cfg.light.radiance_rgb[0], cfg.light.radiance_rgb[1], cfg.light.radiance_rgb[2]
+                ));
+                s.push_str("    </emitter>\n\n");
+            }
+            LightType::Spot => {
+                s.push_str("    <emitter type=\"spot\">\n");
+                s.push_str("        <transform name=\"to_world\">\n");
+                s.push_str(&format!(
+                    "            <lookat origin=\"{}, {}, {}\" target=\"{}, {}, {}\"/>\n",
+                    cfg.light.spot_position[0],
+                    cfg.light.spot_position[1],
+                    cfg.light.spot_position[2],
+                    cfg.light.spot_target[0],
+                    cfg.light.spot_target[1],
+                    cfg.light.spot_target[2]
+                ));
+                s.push_str("        </transform>\n");
+                s.push_str(&format!(
+                    "        <rgb name=\"intensity\" value=\"{}, {}, {}\"/>\n",
+                    cfg.light.radiance_rgb[0], cfg.light.radiance_rgb[1], cfg.light.radiance_rgb[2]
+                ));
+                s.push_str(&format!(
+                    "        <float name=\"cutoff_angle\" value=\"{}\"/>\n",
+                    cfg.light.spot_cutoff_angle
+                ));
+                s.push_str(&format!(
+                    "        <float name=\"beam_width\" value=\"{}\"/>\n",
+                    cfg.light.spot_beam_width
+                ));
+                s.push_str("    </emitter>\n\n");
+            }
+            LightType::Directional => {
+                s.push_str("    <emitter type=\"directional\">\n");
+                s.push_str(&format!(
+                    "        <vector name=\"direction\" x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+                    cfg.light.directional_direction[0],
+                    cfg.light.directional_direction[1],
+                    cfg.light.directional_direction[2]
+                ));
+                s.push_str(&format!(
+                    "        <rgb name=\"irradiance\" value=\"{}, {}, {}\"/>\n",
+                    cfg.light.radiance_rgb[0], cfg.light.radiance_rgb[1], cfg.light.radiance_rgb[2]
+                ));
+                s.push_str("    </emitter>\n\n");
+            }
+            LightType::Envmap => {
+                s.push_str("    <emitter type=\"envmap\">\n");
+                s.push_str(&format!(
+                    "        <string name=\"filename\" value=\"{}\"/>\n",
+                    cfg.light.envmap_filename
+                ));
+                s.push_str(&format!("        <float name=\"scale\" value=\"{}\"/>\n", cfg.light.envmap_scale));
+                s.push_str("    </emitter>\n\n");
+            }
+        }
     }
 
     // Object

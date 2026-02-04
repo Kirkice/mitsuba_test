@@ -73,8 +73,30 @@ class ObjectSpec:
 
 @dataclass
 class LightSpec:
-    position: np.ndarray
-    radiance: np.ndarray
+    """Light source specification supporting multiple types"""
+    light_type: str  # 'area', 'point', 'spot', 'directional', 'envmap'
+    radiance: np.ndarray  # RGB color/intensity
+
+    # Area light
+    position: np.ndarray | None = None  # Center position for area light
+    scale: float = 1.0  # Area light size
+
+    # Point light
+    point_position: np.ndarray | None = None
+
+    # Spot light
+    spot_position: np.ndarray | None = None
+    spot_direction: np.ndarray | None = None
+    spot_cutoff_angle: float = 30.0
+    spot_beam_width: float = 20.0
+
+    # Directional light
+    directional_direction: np.ndarray | None = None
+
+    # Envmap
+    envmap_filename: str | None = None
+    envmap_scale: float = 1.0
+    envmap_rotation: float = 0.0  # Rotation in degrees
 
 
 @dataclass
@@ -87,7 +109,7 @@ class WallSpec:
     reflectance: np.ndarray  # RGB color
 
 
-def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, LightSpec, list[WallSpec]]:
+def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, list[LightSpec], list[WallSpec]]:
     import xml.etree.ElementTree as ET
 
     root = ET.parse(scene_path).getroot()
@@ -104,23 +126,146 @@ def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, LightSpec, li
     width = int(_xml_find_first(film, "./integer[@name='width']").attrib["value"])
     height = int(_xml_find_first(film, "./integer[@name='height']").attrib["value"])
 
-    # Light: use first area emitter and infer a point at its translated center.
-    light_pos = np.array([0.0, 1.99, 0.0], dtype=np.float32)
-    light_rad = np.array([18.0, 18.0, 18.0], dtype=np.float32)
+    # Parse all lights
+    lights = []
+
+    # Parse area lights
     for shape in root.findall("./shape"):
         emitter = shape.find("./emitter[@type='area']")
         if emitter is None:
             continue
+
+        light_pos = np.array([0.0, 1.99, 0.0], dtype=np.float32)
+        light_rad = np.array([18.0, 18.0, 18.0], dtype=np.float32)
+        light_scale = 0.35
+
         rgb = emitter.find("./rgb[@name='radiance']")
         if rgb is not None:
             light_rad = _parse_vec3(rgb.attrib["value"])
+
         tr = shape.find("./transform[@name='to_world']/translate")
         if tr is not None:
             light_pos = np.array(
                 [float(tr.attrib.get("x", 0.0)), float(tr.attrib.get("y", 0.0)), float(tr.attrib.get("z", 0.0))],
                 dtype=np.float32,
             )
-        break
+
+        scale_elem = shape.find("./transform[@name='to_world']/scale")
+        if scale_elem is not None:
+            light_scale = float(scale_elem.attrib.get("x", 0.35))
+
+        lights.append(LightSpec(
+            light_type='area',
+            radiance=light_rad,
+            position=light_pos,
+            scale=light_scale,
+        ))
+
+    # Parse point lights
+    for emitter in root.findall("./emitter[@type='point']"):
+        light_rad = np.array([10.0, 10.0, 10.0], dtype=np.float32)
+        light_pos = np.array([0.0, 1.5, 0.0], dtype=np.float32)
+
+        rgb = emitter.find("./rgb[@name='intensity']")
+        if rgb is not None:
+            light_rad = _parse_vec3(rgb.attrib["value"])
+
+        point_elem = emitter.find("./point[@name='position']")
+        if point_elem is not None:
+            light_pos = np.array(
+                [float(point_elem.attrib.get("x", 0.0)),
+                 float(point_elem.attrib.get("y", 0.0)),
+                 float(point_elem.attrib.get("z", 0.0))],
+                dtype=np.float32,
+            )
+
+        lights.append(LightSpec(
+            light_type='point',
+            radiance=light_rad,
+            point_position=light_pos,
+        ))
+
+    # Parse spot lights
+    for emitter in root.findall("./emitter[@type='spot']"):
+        light_rad = np.array([10.0, 10.0, 10.0], dtype=np.float32)
+        spot_pos = np.array([0.0, 2.0, 0.0], dtype=np.float32)
+        spot_target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        cutoff_angle = 30.0
+        beam_width = 20.0
+
+        rgb = emitter.find("./rgb[@name='intensity']")
+        if rgb is not None:
+            light_rad = _parse_vec3(rgb.attrib["value"])
+
+        lookat = emitter.find("./transform[@name='to_world']/lookat")
+        if lookat is not None:
+            spot_pos = _parse_vec3(lookat.attrib["origin"])
+            spot_target = _parse_vec3(lookat.attrib["target"])
+
+        cutoff_elem = emitter.find("./float[@name='cutoff_angle']")
+        if cutoff_elem is not None:
+            cutoff_angle = float(cutoff_elem.attrib["value"])
+
+        beam_elem = emitter.find("./float[@name='beam_width']")
+        if beam_elem is not None:
+            beam_width = float(beam_elem.attrib["value"])
+
+        spot_dir = spot_target - spot_pos
+        spot_dir = spot_dir / (np.linalg.norm(spot_dir) + 1e-8)
+
+        lights.append(LightSpec(
+            light_type='spot',
+            radiance=light_rad,
+            spot_position=spot_pos,
+            spot_direction=spot_dir,
+            spot_cutoff_angle=cutoff_angle,
+            spot_beam_width=beam_width,
+        ))
+
+    # Parse directional lights
+    for emitter in root.findall("./emitter[@type='directional']"):
+        light_rad = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        light_dir = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+
+        rgb = emitter.find("./rgb[@name='irradiance']")
+        if rgb is not None:
+            light_rad = _parse_vec3(rgb.attrib["value"])
+
+        vec_elem = emitter.find("./vector[@name='direction']")
+        if vec_elem is not None:
+            light_dir = np.array(
+                [float(vec_elem.attrib.get("x", 0.0)),
+                 float(vec_elem.attrib.get("y", -1.0)),
+                 float(vec_elem.attrib.get("z", 0.0))],
+                dtype=np.float32,
+            )
+            light_dir = light_dir / (np.linalg.norm(light_dir) + 1e-8)
+
+        lights.append(LightSpec(
+            light_type='directional',
+            radiance=light_rad,
+            directional_direction=light_dir,
+        ))
+
+    # Parse envmap lights
+    for emitter in root.findall("./emitter[@type='envmap']"):
+        filename = "textures/envmap.exr"
+        scale = 1.0
+
+        filename_elem = emitter.find("./string[@name='filename']")
+        if filename_elem is not None:
+            filename = filename_elem.attrib["value"]
+
+        scale_elem = emitter.find("./float[@name='scale']")
+        if scale_elem is not None:
+            scale = float(scale_elem.attrib["value"])
+
+        lights.append(LightSpec(
+            light_type='envmap',
+            radiance=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            envmap_filename=filename,
+            envmap_scale=scale,
+        ))
 
     # Object: pick the first non-rectangle primitive/mesh.
     obj_kind = None
@@ -228,8 +373,7 @@ def parse_scene_xml(scene_path: Path) -> Tuple[Camera, ObjectSpec, LightSpec, li
 
     cam = Camera(origin=origin, target=target, up=up, fov_deg=fov, width=width, height=height)
     obj = ObjectSpec(kind=obj_kind, translate=obj_translate, scale=obj_scale, radius=radius, filename=filename)
-    light = LightSpec(position=light_pos, radiance=light_rad)
-    return cam, obj, light, walls
+    return cam, obj, lights, walls
 
 
 def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -503,6 +647,7 @@ def main() -> int:
     ap.add_argument("--out-dir", default="renders/fit", help="Output directory")
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Torch device")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--config", type=str, help="JSON config file path (.mitsuba_studio_state.json)")
     args = ap.parse_args()
 
     ws = Path.cwd()
@@ -565,9 +710,27 @@ def main() -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    cam, obj, light, walls = parse_scene_xml(scene_path)
+    cam, obj, lights, walls = parse_scene_xml(scene_path)
 
-    print(f"Parsed 1 light and {len(walls)} wall(s) from scene")
+    # Override light config from JSON if provided
+    if args.config:
+        import json
+        config_path = Path(args.config)
+        if not config_path.is_absolute():
+            config_path = ws / config_path
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                full_config = json.load(f)
+                if 'config' in full_config and 'light' in full_config['config']:
+                    light_config = full_config['config']['light']
+                    # Update envmap rotation if light is envmap type
+                    for light in lights:
+                        if light.light_type == 'envmap':
+                            if 'envmap_rotation' in light_config:
+                                light.envmap_rotation = light_config['envmap_rotation']
+                                print(f"Loaded envmap rotation from config: {light.envmap_rotation} degrees")
+
+    print(f"Parsed {len(lights)} light(s) and {len(walls)} wall(s) from scene")
 
     # Load/build object mesh
     if obj.kind == "sphere":
@@ -631,26 +794,164 @@ def main() -> int:
     # GT to torch
     gt = torch.from_numpy(img_gt_np).to(device=device, dtype=torch.float32)
 
-    # Create area light samples (simulate area light as multiple point samples)
-    # Cornell Box light is 0.35x0.35 square at y=1.99
-    area_light_samples = []
-    area_light_radiance = []
-    light_size = 0.35  # Cornell Box light size
-    num_samples = 5
-    base_pos = light.position
+    # Camera position for view direction (needed for specular IBL)
+    cam_pos_t = torch.from_numpy(cam.origin).to(device=device, dtype=torch.float32)
 
-    for i in range(num_samples):
-        for j in range(num_samples):
-            # Offset from center (-0.5 to +0.5) * light_size
-            offset_x = (i / (num_samples - 1) - 0.5) * light_size
-            offset_z = (j / (num_samples - 1) - 0.5) * light_size
-            sample_pos = base_pos + np.array([offset_x, 0.0, offset_z], dtype=np.float32)
-            area_light_samples.append(torch.from_numpy(sample_pos).to(device=device, dtype=torch.float32))
-            # Divide radiance by number of samples to conserve energy
-            area_light_radiance.append(torch.from_numpy(light.radiance / (num_samples * num_samples)).to(device=device, dtype=torch.float32))
+    # Prepare light sources for rendering
+    point_light_positions = []
+    point_light_radiances = []
+
+    spot_light_positions = []
+    spot_light_directions = []
+    spot_light_radiances = []
+    spot_light_cutoffs = []
+    spot_light_beam_widths = []
+
+    directional_light_directions = []
+    directional_light_irradiances = []
+
+    envmap_data = None
+    envmap_scale_val = 1.0
+    envmap_rotation_val = 0.0  # Rotation in degrees
+
+    for light in lights:
+        if light.light_type == 'area':
+            # Sample area light with a grid
+            num_samples = 5
+            light_size = light.scale
+            base_pos = light.position
+
+            for i in range(num_samples):
+                for j in range(num_samples):
+                    offset_x = (i / (num_samples - 1) - 0.5) * light_size
+                    offset_z = (j / (num_samples - 1) - 0.5) * light_size
+                    sample_pos = base_pos + np.array([offset_x, 0.0, offset_z], dtype=np.float32)
+                    point_light_positions.append(torch.from_numpy(sample_pos).to(device=device, dtype=torch.float32))
+                    point_light_radiances.append(torch.from_numpy(light.radiance / (num_samples * num_samples)).to(device=device, dtype=torch.float32))
+
+        elif light.light_type == 'point':
+            point_light_positions.append(torch.from_numpy(light.point_position).to(device=device, dtype=torch.float32))
+            point_light_radiances.append(torch.from_numpy(light.radiance).to(device=device, dtype=torch.float32))
+
+        elif light.light_type == 'spot':
+            spot_light_positions.append(torch.from_numpy(light.spot_position).to(device=device, dtype=torch.float32))
+            spot_light_directions.append(torch.from_numpy(light.spot_direction).to(device=device, dtype=torch.float32))
+            spot_light_radiances.append(torch.from_numpy(light.radiance).to(device=device, dtype=torch.float32))
+            spot_light_cutoffs.append(light.spot_cutoff_angle)
+            spot_light_beam_widths.append(light.spot_beam_width)
+
+        elif light.light_type == 'directional':
+            directional_light_directions.append(torch.from_numpy(light.directional_direction).to(device=device, dtype=torch.float32))
+            directional_light_irradiances.append(torch.from_numpy(light.radiance).to(device=device, dtype=torch.float32))
+
+        elif light.light_type == 'envmap':
+            # Load environment map
+            envmap_path = Path(light.envmap_filename)
+            if not envmap_path.is_absolute():
+                # Resolve relative to working directory, not scene file directory
+                envmap_path = ws / envmap_path
+
+            if envmap_path.exists():
+                envmap_np = None
+                file_ext = str(envmap_path).lower()
+
+                # Try multiple methods to load different formats
+                # Method 1: Try OpenEXR (best for EXR files)
+                if file_ext.endswith('.exr'):
+                    try:
+                        import OpenEXR
+                        import Imath
+
+                        exr_file = OpenEXR.InputFile(str(envmap_path))
+                        header = exr_file.header()
+                        dw = header['dataWindow']
+                        width = dw.max.x - dw.min.x + 1
+                        height = dw.max.y - dw.min.y + 1
+
+                        # Read RGB channels
+                        FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
+                        channels = ['R', 'G', 'B']
+                        rgb = [np.frombuffer(exr_file.channel(c, FLOAT), dtype=np.float32) for c in channels]
+                        envmap_np = np.stack(rgb, axis=-1).reshape(height, width, 3)
+                        print(f"[OK] Loaded EXR using OpenEXR library")
+                    except ImportError:
+                        print("Note: OpenEXR library not found, trying imageio...")
+                    except Exception as e:
+                        print(f"Warning: OpenEXR failed: {e}, trying imageio...")
+
+                # Method 2: Try DDS format (DirectDraw Surface)
+                if envmap_np is None and file_ext.endswith('.dds'):
+                    try:
+                        # Try using Pillow (supports DDS with plugin)
+                        from PIL import Image
+                        from PIL import ImageFile
+                        ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+                        img = Image.open(envmap_path)
+                        envmap_np = np.array(img)
+                        print(f"[OK] Loaded DDS using Pillow")
+                    except ImportError:
+                        print("Note: Pillow not available for DDS, trying imageio...")
+                    except Exception as e:
+                        print(f"Warning: Pillow DDS failed: {e}, trying imageio...")
+
+                    # Fallback: Try imageio for DDS
+                    if envmap_np is None:
+                        try:
+                            import imageio.v3 as iio
+                            envmap_np = iio.imread(envmap_path)
+                            print(f"[OK] Loaded DDS using imageio")
+                        except Exception as e:
+                            print(f"Warning: imageio DDS failed: {e}")
+
+                # Method 3: Try imageio for other formats (PNG, JPG, HDR, etc.)
+                if envmap_np is None:
+                    try:
+                        import imageio.v3 as iio
+                        envmap_np = iio.imread(envmap_path)
+                        print(f"[OK] Loaded using imageio")
+                    except Exception as e:
+                        print(f"Warning: imageio failed: {e}")
+                        if file_ext.endswith('.exr'):
+                            print("\nTo load EXR files, install one of:")
+                            print("  pip install OpenEXR")
+                            print("  pip install imageio[pyav]")
+                            print("  pip install imageio[opencv]")
+                        elif file_ext.endswith('.dds'):
+                            print("\nTo load DDS files, install:")
+                            print("  pip install Pillow")
+                            print("  or: pip install imageio[pyav]")
+
+                # Process loaded image
+                if envmap_np is not None:
+                    if envmap_np.dtype == np.uint8:
+                        envmap_np = envmap_np.astype(np.float32) / 255.0
+                    else:
+                        envmap_np = envmap_np.astype(np.float32)
+
+                    # Ensure 3 channels
+                    if envmap_np.ndim == 2:
+                        envmap_np = np.stack([envmap_np] * 3, axis=-1)
+                    elif envmap_np.shape[-1] == 4:
+                        envmap_np = envmap_np[..., :3]
+
+                    envmap_data = torch.from_numpy(envmap_np).to(device=device, dtype=torch.float32)
+                    envmap_scale_val = light.envmap_scale
+                    envmap_rotation_val = light.envmap_rotation
+                    print(f"  Path: {envmap_path}")
+                    print(f"  Shape: {envmap_data.shape}")
+                    print(f"  Value range: [{envmap_data.min().item():.4f}, {envmap_data.max().item():.4f}]")
+                    print(f"  Rotation: {envmap_rotation_val} degrees")
+                    print(f"  Mean: {envmap_data.mean().item():.4f}")
+                    print(f"  Scale: {envmap_scale_val}")
+                else:
+                    print("Using constant ambient fallback")
+            else:
+                print(f"Warning: Envmap file not found: {envmap_path}")
+                print("Using constant ambient fallback")
 
     # Raster context
-    ctx = drt.RasterizeGLContext()
+    ctx = drt.RasterizeCudaContext()
 
     def render_raster(albedo_rgb: torch.Tensor):
         # rast: [H, W, 4], where rast[..., 3] is triangle id + 1.
@@ -670,21 +971,162 @@ def main() -> int:
         is_object = vertex_colors[..., 0:1] < 0
         per_pixel_albedo = torch.where(is_object, albedo_rgb[None, None, None, :], vertex_colors)
 
-        # Accumulate lighting from all area light samples
+        # Accumulate lighting from all light sources
         col = torch.zeros_like(pos)
-        for light_pos, light_rad in zip(area_light_samples, area_light_radiance):
+
+        # Point lights (includes sampled area lights)
+        for light_pos, light_rad in zip(point_light_positions, point_light_radiances):
             l = light_pos[None, None, None, :] - pos
             dist2 = torch.sum(l * l, dim=-1, keepdim=True).clamp_min(1e-4)
             l_dir = l / torch.sqrt(dist2)
             ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
             col = col + per_pixel_albedo * ndotl * (light_rad[None, None, None, :] / dist2)
 
-        # Increase ambient to approximate indirect illumination
-        ambient = 0.15
-        col = col + per_pixel_albedo * ambient
+        # Spot lights
+        for spot_pos, spot_dir, spot_rad, spot_cutoff, spot_beam in zip(
+            spot_light_positions, spot_light_directions, spot_light_radiances,
+            spot_light_cutoffs, spot_light_beam_widths
+        ):
+            l = spot_pos[None, None, None, :] - pos
+            dist2 = torch.sum(l * l, dim=-1, keepdim=True).clamp_min(1e-4)
+            l_dir = l / torch.sqrt(dist2)
 
-        # Background = 0 (we only compare masked pixels).
-        col = torch.where(mask, col, torch.zeros_like(col))
+            # Spotlight cone falloff
+            spot_dir_normalized = spot_dir[None, None, None, :]
+            cos_angle = torch.sum(-l_dir * spot_dir_normalized, dim=-1, keepdim=True)
+            cos_cutoff = math.cos(math.radians(spot_cutoff))
+            cos_beam = math.cos(math.radians(spot_beam))
+            falloff = torch.clamp((cos_angle - cos_cutoff) / (cos_beam - cos_cutoff + 1e-6), 0.0, 1.0)
+            falloff = falloff * falloff
+
+            ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
+            col = col + per_pixel_albedo * ndotl * (spot_rad[None, None, None, :] / dist2) * falloff
+
+        # Directional lights
+        for dir_light_dir, dir_light_irr in zip(directional_light_directions, directional_light_irradiances):
+            l_dir = -dir_light_dir[None, None, None, :]
+            ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
+            col = col + per_pixel_albedo * ndotl * dir_light_irr[None, None, None, :]
+
+        # Environment map lighting (IBL) or ambient fallback
+        if envmap_data is not None:
+            h_env, w_env = envmap_data.shape[0], envmap_data.shape[1]
+
+            # Helper function to sample envmap
+            def sample_envmap(direction):
+                """Sample envmap using equirectangular projection with bilinear filtering"""
+                dir_normalized = torch.nn.functional.normalize(direction, dim=-1)
+                # Flip both U and V to match orientation
+                u = 1.0 - (torch.atan2(dir_normalized[..., 0:1], dir_normalized[..., 2:3]) / (2.0 * math.pi) + 0.5)
+                v = 1.0 - (torch.asin(torch.clamp(dir_normalized[..., 1:2], -1.0, 1.0)) / math.pi + 0.5)
+
+                # Apply rotation (rotate around vertical axis)
+                u = u + (envmap_rotation_val / 360.0)
+                u = u - torch.floor(u)  # Wrap to [0, 1]
+
+                # Bilinear interpolation
+                x = u.squeeze(-1) * (w_env - 1)
+                y = v.squeeze(-1) * (h_env - 1)
+
+                # Get integer coordinates
+                x0 = torch.floor(x).long().clamp(0, w_env - 1)
+                x1 = (x0 + 1).clamp(0, w_env - 1)
+                y0 = torch.floor(y).long().clamp(0, h_env - 1)
+                y1 = (y0 + 1).clamp(0, h_env - 1)
+
+                # Get fractional parts
+                fx = (x - x0.float()).unsqueeze(-1)
+                fy = (y - y0.float()).unsqueeze(-1)
+
+                # Sample 4 corners
+                c00 = envmap_data[y0, x0]
+                c01 = envmap_data[y0, x1]
+                c10 = envmap_data[y1, x0]
+                c11 = envmap_data[y1, x1]
+
+                # Bilinear interpolation
+                c0 = c00 * (1 - fx) + c01 * fx
+                c1 = c10 * (1 - fx) + c11 * fx
+                result = c0 * (1 - fy) + c1 * fy
+
+                return result * envmap_scale_val
+
+            # Diffuse IBL: sample using normal
+            diffuse_envmap = sample_envmap(nor)
+            diffuse_ibl = per_pixel_albedo * diffuse_envmap[None, ...] / math.pi
+            col = col + diffuse_ibl
+
+            # Specular IBL: sample using reflection direction
+            view_dir = torch.nn.functional.normalize(cam_pos_t[None, None, None, :] - pos, dim=-1)
+            reflect_dir = 2.0 * torch.sum(nor * view_dir, dim=-1, keepdim=True) * nor - view_dir
+            specular_envmap = sample_envmap(reflect_dir)
+
+            # Simple Fresnel approximation (F0 = 0.04 for dielectrics)
+            cos_theta = torch.sum(nor * view_dir, dim=-1, keepdim=True).clamp_min(0.0)
+            f0 = 0.04
+            fresnel = f0 + (1.0 - f0) * torch.pow(1.0 - cos_theta, 5.0)
+
+            # Add specular contribution
+            specular_ibl = fresnel * specular_envmap[None, ...]
+            col = col + specular_ibl
+        else:
+            # Fallback ambient lighting
+            ambient = 0.15
+            col = col + per_pixel_albedo * ambient
+
+        # Handle background
+        if envmap_data is not None:
+            # Compute camera ray directions for all pixels
+            h, w = height, width
+            y_coords, x_coords = torch.meshgrid(
+                torch.arange(h, device=device, dtype=torch.float32),
+                torch.arange(w, device=device, dtype=torch.float32),
+                indexing='ij'
+            )
+
+            # Convert to NDC coordinates [-1, 1]
+            ndc_x = (x_coords / (w - 1)) * 2.0 - 1.0
+            ndc_y = -((y_coords / (h - 1)) * 2.0 - 1.0)  # Flip Y
+
+            # Compute ray directions in camera space
+            aspect = w / float(h)
+            fov_rad = cam.fov_deg * (math.pi / 180.0)
+            tan_half_fov = math.tan(fov_rad / 2.0)
+
+            # Camera space ray directions
+            ray_x = ndc_x * tan_half_fov * aspect
+            ray_y = ndc_y * tan_half_fov
+            ray_z = -torch.ones_like(ray_x)
+
+            # Stack and normalize
+            ray_dirs_cam = torch.stack([ray_x, ray_y, ray_z], dim=-1)
+            ray_dirs_cam = torch.nn.functional.normalize(ray_dirs_cam, dim=-1)
+
+            # Transform to world space
+            cam_forward = torch.nn.functional.normalize(
+                torch.tensor(cam.target, device=device) - torch.tensor(cam.origin, device=device),
+                dim=0
+            )
+            cam_right = torch.nn.functional.normalize(
+                torch.cross(cam_forward, torch.tensor(cam.up, device=device), dim=0),
+                dim=0
+            )
+            cam_up = torch.cross(cam_right, cam_forward, dim=0)
+
+            # Rotation matrix from camera to world
+            rot_cam_to_world = torch.stack([cam_right, cam_up, -cam_forward], dim=1)
+
+            # Apply rotation
+            ray_dirs_world = torch.matmul(ray_dirs_cam, rot_cam_to_world.T)
+            ray_dirs_world = torch.nn.functional.normalize(ray_dirs_world, dim=-1)
+
+            # Sample envmap for background
+            bg_color = sample_envmap(ray_dirs_world)
+            col = torch.where(mask, col, bg_color)
+        else:
+            # Black background
+            col = torch.where(mask, col, torch.zeros_like(col))
+
         return col[0], mask[0]
 
     eps = 1e-3

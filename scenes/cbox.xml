@@ -19,72 +19,18 @@
         </film>
     </sensor>
 
-    <shape type="rectangle">
-        <transform name="to_world">
-            <rotate x="1" y="0" z="0" angle="-90"/>
-            <translate x="0" y="0" z="0"/>
-        </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="0.8, 0.8, 0.8"/>
-        </bsdf>
-    </shape>
-
-    <shape type="rectangle">
-        <transform name="to_world">
-            <rotate x="1" y="0" z="0" angle="90"/>
-            <translate x="0" y="2" z="0"/>
-        </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="0.8, 0.8, 0.8"/>
-        </bsdf>
-    </shape>
-
-    <shape type="rectangle">
-        <transform name="to_world">
-            <translate x="0" y="1" z="-1"/>
-        </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="0.8, 0.8, 0.8"/>
-        </bsdf>
-    </shape>
-
-    <shape type="rectangle">
-        <transform name="to_world">
-            <rotate x="0" y="1" z="0" angle="90"/>
-            <translate x="-1" y="1" z="0"/>
-        </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="0.75, 0.15, 0.15"/>
-        </bsdf>
-    </shape>
-
-    <shape type="rectangle">
-        <transform name="to_world">
-            <rotate x="0" y="1" z="0" angle="-90"/>
-            <translate x="1" y="1" z="0"/>
-        </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="0.15, 0.75, 0.15"/>
-        </bsdf>
-    </shape>
-
-    <shape type="rectangle">
-        <transform name="to_world">
-            <scale x="0.35" y="0.35" z="0.35"/>
-            <rotate x="1" y="0" z="0" angle="90"/>
-            <translate x="0" y="1.99" z="0"/>
-        </transform>
-        <emitter type="area">
-            <rgb name="radiance" value="18, 18, 18"/>
-        </emitter>
-    </shape>
+    <emitter type="envmap">
+        <string name="filename" value="textures/env.png"/>
+        <float name="scale" value="1"/>
+    </emitter>
 
     <shape type="sphere">
         <float name="radius" value="0.35"/>
         <transform name="to_world">
-            <translate x="0" y="0.35" z="0"/>
+            <translate x="0" y="1.2" z="0"/>
         </transform>
         <bsdf type="diffuse">
+            <rgb name="reflectance" value="1, 1, 1"/>
         </bsdf>
     </shape>
 </scene>
