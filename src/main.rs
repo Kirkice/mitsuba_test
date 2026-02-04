@@ -365,6 +365,12 @@ struct MitsubaStudioApp {
     pathtracing_error: String,
     pathtracing_zoom: f32,
 
+    // --- Soft rasterization render output ---
+    softrender_path: String,
+    softrender_texture: Option<TextureHandle>,
+    softrender_error: String,
+    softrender_zoom: f32,
+
     // --- Persistence ---
     state_dirty: bool,
     state_last_save: Option<Instant>,
@@ -381,6 +387,7 @@ enum SidebarTab {
 enum MainTab {
     Training,
     PathTracing,
+    SoftRender,
     Log,
     Xml,
 }
@@ -651,6 +658,11 @@ impl MitsubaStudioApp {
             pathtracing_error: "".to_string(),
             pathtracing_zoom: 1.0,
 
+            softrender_path: "renders/softrender.png".to_string(),
+            softrender_texture: None,
+            softrender_error: "".to_string(),
+            softrender_zoom: 1.0,
+
             state_dirty: false,
             state_last_save: None,
         }
@@ -858,6 +870,45 @@ impl MitsubaStudioApp {
         self.pathtracing_error.clear();
         if set_status {
             self.last_status = format!("Loaded path tracing: {}", path.display());
+        }
+    }
+
+    fn load_softrender_texture(&mut self, ctx: &egui::Context, set_status: bool) {
+        let rel = self.softrender_path.trim();
+        if rel.is_empty() {
+            self.softrender_error = "Soft render path is empty".to_string();
+            self.softrender_texture = None;
+            return;
+        }
+
+        let path = self.workspace_root().join(rel);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(err) => {
+                self.softrender_error = format!("Failed to read {}: {}", path.display(), err);
+                self.softrender_texture = None;
+                return;
+            }
+        };
+
+        let dyn_img = match image::load_from_memory(&bytes) {
+            Ok(img) => img,
+            Err(err) => {
+                self.softrender_error = format!("Failed to decode image: {}", err);
+                self.softrender_texture = None;
+                return;
+            }
+        };
+
+        let rgba = dyn_img.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+
+        self.softrender_texture =
+            Some(ctx.load_texture("softrender_png", color_image, egui::TextureOptions::LINEAR));
+        self.softrender_error.clear();
+        if set_status {
+            self.last_status = format!("Loaded soft render: {}", path.display());
         }
     }
 
@@ -1158,6 +1209,24 @@ impl eframe::App for MitsubaStudioApp {
                                         "cuda_ad_rgb".to_string(),
                                         "--spp".to_string(),
                                         "4".to_string(),
+                                    ]);
+                                }
+                            }
+
+                            if ui.button("Soft Render").clicked() {
+                                self.mark_state_dirty();
+                                if self.write_xml_to_scene_path() {
+                                    // Set softrender path and switch to SoftRender tab
+                                    self.main_tab = MainTab::SoftRender;
+
+                                    self.start_python_job(vec![
+                                        "tools/mitsuba_soft_render.py".to_string(),
+                                        "--scene".to_string(),
+                                        self.render_scene_path.clone(),
+                                        "--out".to_string(),
+                                        self.softrender_path.clone(),
+                                        "--config".to_string(),
+                                        ".mitsuba_studio_state.json".to_string(),
                                     ]);
                                 }
                             }
@@ -2029,6 +2098,7 @@ impl eframe::App for MitsubaStudioApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.main_tab, MainTab::Training, "Training");
                 ui.selectable_value(&mut self.main_tab, MainTab::PathTracing, "Path Tracing");
+                ui.selectable_value(&mut self.main_tab, MainTab::SoftRender, "Soft Render");
                 ui.selectable_value(&mut self.main_tab, MainTab::Log, "Log");
                 ui.selectable_value(&mut self.main_tab, MainTab::Xml, "XML");
             });
@@ -2215,6 +2285,87 @@ impl eframe::App for MitsubaStudioApp {
                             } else if !self.pathtracing_error.is_empty() {
                                 ui.centered_and_justified(|ui| {
                                     ui.colored_label(egui::Color32::LIGHT_RED, &self.pathtracing_error);
+                                });
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(egui::RichText::new("No render loaded").weak());
+                                });
+                            }
+                        });
+                    });
+                }
+                MainTab::SoftRender => {
+                    ui.horizontal(|ui| {
+                        ui.label("Soft Rasterization Render");
+                        ui.add_space(8.0);
+                        ui.label("Path");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.softrender_path)
+                                    .desired_width(260.0),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        if ui.button("Reload").clicked() {
+                            self.load_softrender_texture(ctx, true);
+                        }
+                        ui.separator();
+                        ui.label("Zoom");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.softrender_zoom, 0.25..=2.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.mark_state_dirty();
+                        }
+                        ui.label(format!("{:.2}×", self.softrender_zoom));
+                    });
+                    ui.add_space(8.0);
+
+                    // First-time auto load
+                    if self.softrender_texture.is_none() && self.softrender_error.is_empty() {
+                        self.load_softrender_texture(ctx, false);
+                    }
+
+                    let available = ui.available_size();
+                    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+                    let frame = egui::Frame::canvas(ui.style())
+                        .rounding(egui::Rounding::same(12.0))
+                        .inner_margin(egui::Margin::same(12.0));
+                    frame.show(ui, |ui| {
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.set_min_size(rect.size());
+
+                            if let Some(tex) = &self.softrender_texture {
+                                // Fit using configured film aspect ratio
+                                let film_aspect = if self.config.film.width > 0 {
+                                    self.config.film.height as f32 / self.config.film.width as f32
+                                } else {
+                                    1.0
+                                };
+
+                                let max_w = ui.available_width().max(1.0);
+                                let max_h = ui.available_height().max(1.0);
+                                let mut w = max_w;
+                                let mut h = w * film_aspect;
+                                if h > max_h {
+                                    h = max_h;
+                                    w = (h / film_aspect).max(1.0);
+                                }
+
+                                ui.centered_and_justified(|ui| {
+                                    ui.image((
+                                        tex.id(),
+                                        egui::vec2(w * self.softrender_zoom, h * self.softrender_zoom),
+                                    ));
+                                });
+                            } else if !self.softrender_error.is_empty() {
+                                ui.centered_and_justified(|ui| {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, &self.softrender_error);
                                 });
                             } else {
                                 ui.centered_and_justified(|ui| {
