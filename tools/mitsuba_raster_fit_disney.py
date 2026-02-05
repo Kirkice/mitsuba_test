@@ -624,6 +624,7 @@ def save_image_u8(path: Path, img_linear: np.ndarray, gamma: float = 2.2):
 def disney_brdf(
     n, l, v, h,
     base_color, roughness, metallic, specular,
+    specular_tint, anisotropic,
     eps=1e-8
 ):
     """Disney principled BRDF (simplified implementation).
@@ -640,6 +641,8 @@ def disney_brdf(
         roughness: roughness [B, H, W, 1]
         metallic: metallic [B, H, W, 1]
         specular: specular reflectance [B, H, W, 1]
+        specular_tint: specular tint [B, H, W, 1]
+        anisotropic: anisotropic [B, H, W, 1]
         eps: small epsilon for numerical stability
 
     Returns:
@@ -651,6 +654,7 @@ def disney_brdf(
     ndotv = torch.sum(n * v, dim=-1, keepdim=True).clamp_min(eps)
     ndoth = torch.sum(n * h, dim=-1, keepdim=True).clamp_min(0.0)
     ldoth = torch.sum(l * h, dim=-1, keepdim=True).clamp_min(0.0)
+    vdoth = torch.sum(v * h, dim=-1, keepdim=True).clamp_min(0.0)
 
     # --- Diffuse component (Disney diffuse) ---
     # Simplified Lambertian with roughness-based retro-reflection
@@ -663,24 +667,66 @@ def disney_brdf(
     diffuse = base_color * fd / torch.pi
 
     # --- Specular component (GGX + Smith + Fresnel) ---
-    # Normal distribution function (GGX/Trowbridge-Reitz)
-    alpha = roughness * roughness
-    alpha2 = alpha * alpha
-    denom = ndoth * ndoth * (alpha2 - 1.0) + 1.0
-    D = alpha2 / (torch.pi * denom * denom + eps)
-
-    # Geometric attenuation (Smith GGX)
-    G = geometric_smith_ggx(ndotl, ndotv, roughness, eps)
-
-    # Fresnel (Schlick approximation)
-    # F0 = dielectric reflectance for metals, base_color for metals
-    f0_dielectric = 0.08 * specular  # Default dielectric F0 scaled by specular param
-    F0 = torch.lerp(
-        f0_dielectric.expand_as(base_color),
-        base_color,
-        metallic
+    # Disney-like specular tint: tint the dielectric specular color towards base_color hue.
+    # Avoid division blow-ups for very dark base_color.
+    lum = (0.3 * base_color[..., 0:1] + 0.6 * base_color[..., 1:2] + 0.1 * base_color[..., 2:3])
+    tint_color = torch.where(
+        lum > 1e-4,
+        base_color / lum.clamp_min(1e-4),
+        torch.ones_like(base_color),
     )
-    F = fresnel_schlick(ldoth, F0)
+    tint_color = torch.clamp(tint_color, 0.0, 1.0)
+    spec_color = torch.lerp(torch.ones_like(base_color), tint_color, specular_tint)
+
+    # Disney anisotropic GGX parameters
+    # (matches the common Disney mapping; anisotropic=0 => isotropic)
+    a = (roughness * roughness).clamp_min(1e-4)
+    aspect = torch.sqrt((1.0 - 0.9 * anisotropic).clamp_min(1e-4))
+    alpha_x = (a / aspect).clamp_min(1e-4)
+    alpha_y = (a * aspect).clamp_min(1e-4)
+
+    # Build a stable tangent frame from the normal (no UVs available)
+    up = torch.where(
+        (torch.abs(n[..., 2:3]) < 0.999).expand_as(n),
+        torch.tensor([0.0, 0.0, 1.0], device=n.device, dtype=n.dtype).view(1, 1, 1, 3).expand_as(n),
+        torch.tensor([1.0, 0.0, 0.0], device=n.device, dtype=n.dtype).view(1, 1, 1, 3).expand_as(n),
+    )
+    t = torch.nn.functional.normalize(torch.cross(up, n, dim=-1), dim=-1)
+    b = torch.cross(n, t, dim=-1)
+
+    def to_tangent(w):
+        wx = torch.sum(w * t, dim=-1, keepdim=True)
+        wy = torch.sum(w * b, dim=-1, keepdim=True)
+        wz = torch.sum(w * n, dim=-1, keepdim=True)
+        return wx, wy, wz
+
+    hx, hy, hz = to_tangent(h)
+
+    # Anisotropic GGX NDF (Heitz)
+    denom = (hx * hx) / (alpha_x * alpha_x) + (hy * hy) / (alpha_y * alpha_y) + (hz * hz)
+    D = 1.0 / (torch.pi * alpha_x * alpha_y * denom * denom + eps)
+
+    # Anisotropic Smith masking-shadowing (approx)
+    def G1_aniso(w):
+        wx, wy, wz = to_tangent(w)
+        wz = wz.clamp_min(eps)
+        tan2 = ((wx * wx) * (alpha_x * alpha_x) + (wy * wy) * (alpha_y * alpha_y)) / (wz * wz)
+        lam = 0.5 * (torch.sqrt(1.0 + tan2) - 1.0)
+        return 1.0 / (1.0 + lam)
+
+    G = G1_aniso(l) * G1_aniso(v)
+
+    # Fresnel
+    # Unreal Engine modified Schlick using VoH and a damped grazing term.
+    # Disney's 'specular' parameter maps to F0 via 0.08 * specular.
+    f0_scalar = (0.08 * specular).clamp(0.0, 1.0)
+    F0_diel_rgb = f0_scalar * spec_color
+    F_diel_rgb = fresnel_schlick_ue(F0_diel_rgb, vdoth)
+
+    # Metals: Schlick with base_color as RGB F0
+    F_metal = fresnel_schlick(vdoth, base_color)
+
+    F = torch.lerp(F_diel_rgb, F_metal, metallic)
 
     # Cook-Torrance specular BRDF
     specular_brdf = (D * G * F) / (4.0 * ndotl * ndotv + eps)
@@ -704,6 +750,64 @@ def fresnel_schlick(cos_theta, F0):
     """Fresnel-Schlick approximation"""
     import torch
     return F0 + (1.0 - F0) * schlick_weight(cos_theta)
+
+def fresnel_schlick_scalar(f0, u):
+    """Scalar Schlick Fresnel matching:
+    F_Schlick(f0, u) = (1 - f0) * (1 - u)^5 + f0
+
+    Args:
+        f0: scalar reflectance at normal incidence [..., 1]
+        u: cosine term (typically L·H or V·H) [..., 1]
+    """
+    import torch
+    f0 = torch.clamp(f0, 0.0, 1.0)
+    u = torch.clamp(u, 0.0, 1.0)
+    x = 1.0 - u
+    x2 = x * x
+    x5 = x * x2 * x2
+    return (1.0 - f0) * x5 + f0
+
+
+def fresnel_schlick_ue(specular_color, voh):
+    """Unreal Engine modified Schlick Fresnel.
+
+    Fc = Pow5(1 - VoH)
+    F = saturate(50 * SpecularColor.g) * Fc + (1 - Fc) * SpecularColor
+
+    Args:
+        specular_color: RGB F0 [..., 3]
+        voh: cosine term V·H [..., 1]
+    """
+    import torch
+
+    voh = torch.clamp(voh, 0.0, 1.0)
+    fc = schlick_weight(voh)
+    damp = torch.clamp(50.0 * specular_color[..., 1:2], 0.0, 1.0)
+    return damp * fc + (1.0 - fc) * specular_color
+
+
+def fresnel_dielectric(cos_theta_i, eta, eps=1e-8):
+    """Exact unpolarized Fresnel for dielectrics.
+
+    This is used to avoid the Schlick edge case where F0=0 still yields
+    strong grazing reflections. With eta=1 (air), Fresnel is 0 for all angles.
+    """
+    import torch
+
+    cos_theta_i = torch.clamp(cos_theta_i, 0.0, 1.0)
+    eta = eta.clamp_min(1.0)
+
+    sin2_theta_i = torch.clamp(1.0 - cos_theta_i * cos_theta_i, 0.0, 1.0)
+    sin2_theta_t = sin2_theta_i / (eta * eta + eps)
+
+    tir = sin2_theta_t > 1.0
+    cos_theta_t = torch.sqrt(torch.clamp(1.0 - sin2_theta_t, 0.0, 1.0))
+
+    r_parl = ((eta * cos_theta_i) - cos_theta_t) / ((eta * cos_theta_i) + cos_theta_t + eps)
+    r_perp = (cos_theta_i - eta * cos_theta_t) / (cos_theta_i + eta * cos_theta_t + eps)
+    F = 0.5 * (r_parl * r_parl + r_perp * r_perp)
+
+    return torch.where(tir, torch.ones_like(F), F)
 
 
 def geometric_smith_ggx(ndotl, ndotv, roughness, eps=1e-8):
@@ -845,6 +949,67 @@ def main() -> int:
 
     print(f"Parsed {len(lights)} light(s) and {len(walls)} wall(s) from scene")
 
+    # --- Material parameter initialization (optionally from .mitsuba_studio_state.json) ---
+    if disney_material_config is not None:
+        init_base_color = np.array(disney_material_config['base_color']['value'], dtype=np.float32)
+        init_roughness = float(disney_material_config['roughness']['value'])
+        init_metallic = float(disney_material_config['metallic']['value'])
+        init_specular = float(disney_material_config['specular']['value'])
+        init_specular_tint = float(disney_material_config['specular_tint']['value'])
+        init_anisotropic = float(disney_material_config['anisotropic']['value'])
+        init_sheen = float(disney_material_config['sheen']['value'])
+        init_sheen_tint = float(disney_material_config['sheen_tint']['value'])
+        init_clearcoat = float(disney_material_config['clearcoat']['value'])
+        init_clearcoat_gloss = float(disney_material_config['clearcoat_gloss']['value'])
+
+        diff_base_color = bool(disney_material_config['base_color']['differentiable'])
+        diff_roughness = bool(disney_material_config['roughness']['differentiable'])
+        diff_metallic = bool(disney_material_config['metallic']['differentiable'])
+        diff_specular = bool(disney_material_config['specular']['differentiable'])
+        diff_specular_tint = bool(disney_material_config['specular_tint']['differentiable'])
+        diff_anisotropic = bool(disney_material_config['anisotropic']['differentiable'])
+        diff_sheen = bool(disney_material_config['sheen']['differentiable'])
+        diff_sheen_tint = bool(disney_material_config['sheen_tint']['differentiable'])
+        diff_clearcoat = bool(disney_material_config['clearcoat']['differentiable'])
+        diff_clearcoat_gloss = bool(disney_material_config['clearcoat_gloss']['differentiable'])
+
+        print("Using Disney material config:")
+        print(f"  base_color: {init_base_color.tolist()} (diff={diff_base_color})")
+        print(f"  roughness: {init_roughness} (diff={diff_roughness})")
+        print(f"  metallic: {init_metallic} (diff={diff_metallic})")
+        print(f"  specular: {init_specular} (diff={diff_specular})")
+        print(f"  specular_tint: {init_specular_tint} (diff={diff_specular_tint})")
+        print(f"  anisotropic: {init_anisotropic} (diff={diff_anisotropic})")
+        print(f"  sheen: {init_sheen} (diff={diff_sheen})")
+        print(f"  sheen_tint: {init_sheen_tint} (diff={diff_sheen_tint})")
+        print(f"  clearcoat: {init_clearcoat} (diff={diff_clearcoat})")
+        print(f"  clearcoat_gloss: {init_clearcoat_gloss} (diff={diff_clearcoat_gloss})")
+    else:
+        init_base_color = np.array([float(x) for x in args.init_base_color.split(",")], dtype=np.float32)
+        if init_base_color.shape[0] != 3:
+            raise ValueError("--init-base-color must have 3 values")
+        init_roughness = args.init_roughness
+        init_metallic = args.init_metallic
+        init_specular = args.init_specular
+        init_specular_tint = args.init_specular_tint
+        init_anisotropic = args.init_anisotropic
+        init_sheen = args.init_sheen
+        init_sheen_tint = args.init_sheen_tint
+        init_clearcoat = args.init_clearcoat
+        init_clearcoat_gloss = args.init_clearcoat_gloss
+
+        # Default: optimize base_color and roughness only
+        diff_base_color = True
+        diff_roughness = True
+        diff_metallic = False
+        diff_specular = False
+        diff_specular_tint = False
+        diff_anisotropic = False
+        diff_sheen = False
+        diff_sheen_tint = False
+        diff_clearcoat = False
+        diff_clearcoat_gloss = False
+
     # Load/build object mesh
     if obj.kind == "sphere":
         v_obj, f_obj, n_obj = make_uv_sphere_mesh(radius=obj.radius)
@@ -898,72 +1063,10 @@ def main() -> int:
     # Homogeneous coordinates
     ones = torch.ones((v_t.shape[0], 1), device=device, dtype=torch.float32)
     v_h = torch.cat([v_t, ones], dim=1)
-    v_clip = (v_h @ mvp_t.T).contiguous()
-
-    # Parse initial values (override with config if available)
-    if disney_material_config:
-        init_base_color = np.array(disney_material_config['base_color']['value'], dtype=np.float32)
-        init_roughness = disney_material_config['roughness']['value']
-        init_metallic = disney_material_config['metallic']['value']
-        init_specular = disney_material_config['specular']['value']
-        init_specular_tint = disney_material_config['specular_tint']['value']
-        init_anisotropic = disney_material_config['anisotropic']['value']
-        init_sheen = disney_material_config['sheen']['value']
-        init_sheen_tint = disney_material_config['sheen_tint']['value']
-        init_clearcoat = disney_material_config['clearcoat']['value']
-        init_clearcoat_gloss = disney_material_config['clearcoat_gloss']['value']
-
-        # Differentiability flags
-        diff_base_color = disney_material_config['base_color']['differentiable']
-        diff_roughness = disney_material_config['roughness']['differentiable']
-        diff_metallic = disney_material_config['metallic']['differentiable']
-        diff_specular = disney_material_config['specular']['differentiable']
-        diff_specular_tint = disney_material_config['specular_tint']['differentiable']
-        diff_anisotropic = disney_material_config['anisotropic']['differentiable']
-        diff_sheen = disney_material_config['sheen']['differentiable']
-        diff_sheen_tint = disney_material_config['sheen_tint']['differentiable']
-        diff_clearcoat = disney_material_config['clearcoat']['differentiable']
-        diff_clearcoat_gloss = disney_material_config['clearcoat_gloss']['differentiable']
-
-        print("Using Disney material config:")
-        print(f"  base_color: {init_base_color} (diff={diff_base_color})")
-        print(f"  roughness: {init_roughness} (diff={diff_roughness})")
-        print(f"  metallic: {init_metallic} (diff={diff_metallic})")
-        print(f"  specular: {init_specular} (diff={diff_specular})")
-        print(f"  specular_tint: {init_specular_tint} (diff={diff_specular_tint})")
-        print(f"  anisotropic: {init_anisotropic} (diff={diff_anisotropic})")
-        print(f"  sheen: {init_sheen} (diff={diff_sheen})")
-        print(f"  sheen_tint: {init_sheen_tint} (diff={diff_sheen_tint})")
-        print(f"  clearcoat: {init_clearcoat} (diff={diff_clearcoat})")
-        print(f"  clearcoat_gloss: {init_clearcoat_gloss} (diff={diff_clearcoat_gloss})")
-    else:
-        init_base_color = np.array([float(x) for x in args.init_base_color.split(",")], dtype=np.float32)
-        if init_base_color.shape[0] != 3:
-            raise ValueError("--init-base-color must have 3 values")
-        init_roughness = args.init_roughness
-        init_metallic = args.init_metallic
-        init_specular = args.init_specular
-        init_specular_tint = args.init_specular_tint
-        init_anisotropic = args.init_anisotropic
-        init_sheen = args.init_sheen
-        init_sheen_tint = args.init_sheen_tint
-        init_clearcoat = args.init_clearcoat
-        init_clearcoat_gloss = args.init_clearcoat_gloss
-
-        # Default: optimize base_color and roughness only
-        diff_base_color = True
-        diff_roughness = True
-        diff_metallic = False
-        diff_specular = False
-        diff_specular_tint = False
-        diff_anisotropic = False
-        diff_sheen = False
-        diff_sheen_tint = False
-        diff_clearcoat = False
-        diff_clearcoat_gloss = False
+    v_clip = (v_h @ mvp_t.t())
 
     # Helper function to safely compute logit transform
-    def safe_logit(value, eps=1e-6):
+    def safe_logit(value, eps=1e-4):
         """Compute logit while clamping input to safe range [eps, 1-eps]"""
         clamped = max(eps, min(1.0 - eps, value))
         return math.log(clamped / (1.0 - clamped))
@@ -1221,8 +1324,8 @@ def main() -> int:
     # Raster context
     ctx = drt.RasterizeCudaContext()
 
-    # Increase ambient light to approximate indirect illumination from colored walls
-    ambient_color = torch.tensor([0.15, 0.15, 0.15], device=device, dtype=torch.float32)
+    # Constant ambient fallback (used when no envmap lighting is available)
+    ambient_color = torch.tensor([0.0, 0.0, 0.0], device=device, dtype=torch.float32)
 
     # ===== GGX Importance Sampling Functions =====
     def radical_inverse_vdc(bits):
@@ -1295,6 +1398,8 @@ def main() -> int:
         per_pixel_roughness = torch.where(is_object, roughness[None, None, None, :], torch.ones_like(roughness[None, None, None, :]))
         per_pixel_metallic = torch.where(is_object, metallic[None, None, None, :], torch.zeros_like(metallic[None, None, None, :]))
         per_pixel_specular = torch.where(is_object, specular[None, None, None, :], torch.ones_like(specular[None, None, None, :]) * 0.5)
+        per_pixel_specular_tint = torch.where(is_object, specular_tint[None, None, None, :], torch.zeros_like(specular_tint[None, None, None, :]))
+        per_pixel_anisotropic = torch.where(is_object, anisotropic[None, None, None, :], torch.zeros_like(anisotropic[None, None, None, :]))
 
         # View direction
         view_dir = torch.nn.functional.normalize(cam_pos_t[None, None, None, :] - pos, dim=-1)
@@ -1314,7 +1419,9 @@ def main() -> int:
                 per_pixel_base_color,
                 per_pixel_roughness,
                 per_pixel_metallic,
-                per_pixel_specular
+                per_pixel_specular,
+                per_pixel_specular_tint,
+                per_pixel_anisotropic,
             )
 
             ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
@@ -1346,7 +1453,9 @@ def main() -> int:
                 per_pixel_base_color,
                 per_pixel_roughness,
                 per_pixel_metallic,
-                per_pixel_specular
+                per_pixel_specular,
+                per_pixel_specular_tint,
+                per_pixel_anisotropic,
             )
 
             ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
@@ -1363,7 +1472,9 @@ def main() -> int:
                 per_pixel_base_color,
                 per_pixel_roughness,
                 per_pixel_metallic,
-                per_pixel_specular
+                per_pixel_specular,
+                per_pixel_specular_tint,
+                per_pixel_anisotropic,
             )
 
             ndotl = torch.sum(nor * l_dir, dim=-1, keepdim=True).clamp_min(0.0)
@@ -1508,19 +1619,25 @@ def main() -> int:
             prefiltered_color = prefiltered_color.reshape(batch, h, w, 3)
 
             # Apply Fresnel
-            f0_dielectric = 0.08 * per_pixel_specular
-            f0 = torch.where(
-                per_pixel_metallic > 0.5,
-                per_pixel_base_color,
-                torch.full_like(per_pixel_base_color, 1.0) * f0_dielectric
+            lum = (0.3 * per_pixel_base_color[..., 0:1] + 0.6 * per_pixel_base_color[..., 1:2] + 0.1 * per_pixel_base_color[..., 2:3])
+            tint_color = torch.where(
+                lum > 1e-4,
+                per_pixel_base_color / lum.clamp_min(1e-4),
+                torch.ones_like(per_pixel_base_color),
             )
+            tint_color = torch.clamp(tint_color, 0.0, 1.0)
+            spec_color = torch.lerp(torch.ones_like(per_pixel_base_color), tint_color, per_pixel_specular_tint)
 
-            cos_theta = torch.sum(nor * view_dir, dim=-1, keepdim=True).clamp_min(0.0)
-            fresnel = f0 + (1.0 - f0) * torch.pow(1.0 - cos_theta, 5.0)
+            cos_theta = torch.sum(nor * view_dir, dim=-1, keepdim=True).clamp(0.0, 1.0)
+            # IBL doesn't have a single V·H, so we approximate using N·V.
+            f0_scalar = (0.08 * per_pixel_specular).clamp(0.0, 1.0)
+            F0_diel_rgb = f0_scalar * spec_color
+            F_diel_rgb = fresnel_schlick_ue(F0_diel_rgb, cos_theta)
 
-            # Apply Fresnel and specular parameter
-            specular_attenuation = per_pixel_specular
-            specular_ibl = fresnel * specular_attenuation * prefiltered_color
+            F_metal = fresnel_schlick(cos_theta, per_pixel_base_color)
+            fresnel = torch.lerp(F_diel_rgb, F_metal, per_pixel_metallic)
+
+            specular_ibl = fresnel * prefiltered_color
             col = col + specular_ibl
         else:
             # Fallback to ambient lighting
@@ -1624,6 +1741,37 @@ def main() -> int:
         loss = torch.sum(masked_diff) / (torch.sum(mask) * 3 + 1e-8)  # Average over valid pixels and channels
 
         loss.backward()
+
+        # If a parameter is marked differentiable but doesn't affect the rendered image,
+        # its gradient will be ~0 and it will not update. Emit a warning to make this obvious.
+        if step % 25 == 0 or step == args.steps - 1:
+            grad_warn_eps = 1e-12
+
+            def warn_if_no_grad(name: str, t):
+                if not getattr(t, "requires_grad", False):
+                    return
+                g = t.grad
+                if g is None:
+                    print(f"[warn] grad[{name}] is None (parameter may be unused in the forward pass)")
+                    return
+                gmax = float(g.detach().abs().max().item())
+                if gmax < grad_warn_eps:
+                    print(
+                        f"[warn] grad[{name}] is ~0 (max|grad|={gmax:.2e}). "
+                        "Parameter won't update; it may be unused or the scene/lighting doesn't constrain it."
+                    )
+
+            warn_if_no_grad("base_color", base_color_logit)
+            warn_if_no_grad("roughness", roughness_logit)
+            warn_if_no_grad("metallic", metallic_logit)
+            warn_if_no_grad("specular", specular_logit)
+            warn_if_no_grad("specular_tint", specular_tint_logit)
+            warn_if_no_grad("anisotropic", anisotropic_logit)
+            warn_if_no_grad("sheen", sheen_logit)
+            warn_if_no_grad("sheen_tint", sheen_tint_logit)
+            warn_if_no_grad("clearcoat", clearcoat_logit)
+            warn_if_no_grad("clearcoat_gloss", clearcoat_gloss_logit)
+
         opt.step()
 
         if step % 25 == 0 or step == args.steps - 1:
@@ -1649,8 +1797,12 @@ def main() -> int:
 
                 # Save progress preview for GUI (2x2 grid layout)
                 pred_np = pred.detach().cpu().numpy().astype(np.float32)
-                pred_clipped = np.clip(pred_np, 0.0, 1.0)
-                gt_clipped = np.clip(img_gt_np, 0.0, 1.0)
+                # Apply a display power curve directly to the shading RGB.
+                # This is intentionally done here (not in the file saver) to keep the rest of the
+                # pipeline unchanged while making the preview match the expected appearance.
+                display_power = 2.2
+                pred_clipped = np.clip(pred_np, 0.0, 1.0) ** display_power
+                gt_clipped = np.clip(img_gt_np, 0.0, 1.0) ** display_power
                 diff = np.clip(np.abs(gt_clipped - pred_clipped) * 3.0, 0.0, 1.0)
 
                 # Create 2x2 grid: [GT | Current]
@@ -1676,8 +1828,8 @@ def main() -> int:
 
                     # Use default font
                     try:
-                        font_large = ImageFont.truetype("arial.ttf", 24)
-                        font_small = ImageFont.truetype("arial.ttf", 18)
+                        font_large = ImageFont.truetype("arial.ttf", 22)
+                        font_small = ImageFont.truetype("arial.ttf", 16)
                     except:
                         font_large = ImageFont.load_default()
                         font_small = font_large
@@ -1691,22 +1843,41 @@ def main() -> int:
 
                     # Draw parameters on bottom right
                     draw.text((w + 10, h + 10), "Parameters:", fill=(255, 255, 255), font=font_large)
+
+                    # Compact multi-line table so all Disney params are visible.
+                    def fmt(name: str, value: str, diff: bool | None):
+                        tag = " [Diff]" if diff else ""
+                        return f"{name}: {value}{tag}"
+
+                    lines = [
+                        fmt("Loss", f"{loss.item():.6f}", None),
+                        fmt("base_color", f"[{bc[0]:.3f} {bc[1]:.3f} {bc[2]:.3f}]", diff_base_color),
+                        fmt("roughness", f"{r:.4f}", diff_roughness),
+                        fmt("metallic", f"{m_val:.4f}", diff_metallic),
+                        fmt("specular", f"{s:.4f}", diff_specular),
+                        fmt("specular_tint", f"{st:.4f}", diff_specular_tint),
+                        fmt("anisotropic", f"{an:.4f}", diff_anisotropic),
+                        fmt("sheen", f"{sh:.4f}", diff_sheen),
+                        fmt("sheen_tint", f"{sht:.4f}", diff_sheen_tint),
+                        fmt("clearcoat", f"{cc:.4f}", diff_clearcoat),
+                        fmt("clearcoat_gloss", f"{ccg:.4f}", diff_clearcoat_gloss),
+                    ]
+
+                    # Estimate a safe line height.
+                    try:
+                        line_h = int((font_small.getbbox("Ag")[3] - font_small.getbbox("Ag")[1]) * 1.25)
+                    except Exception:
+                        line_h = 18
+
                     y_offset = h + 45
-                    draw.text((w + 10, y_offset), f"Loss: {loss.item():.6f}", fill=(255, 200, 200), font=font_small)
-                    y_offset += 25
-                    draw.text((w + 10, y_offset), f"Base Color:", fill=(200, 200, 255), font=font_small)
-                    y_offset += 20
-                    draw.text((w + 20, y_offset), f"  R: {bc[0]:.3f}", fill=(255, 150, 150), font=font_small)
-                    y_offset += 20
-                    draw.text((w + 20, y_offset), f"  G: {bc[1]:.3f}", fill=(150, 255, 150), font=font_small)
-                    y_offset += 20
-                    draw.text((w + 20, y_offset), f"  B: {bc[2]:.3f}", fill=(150, 150, 255), font=font_small)
-                    y_offset += 25
-                    draw.text((w + 10, y_offset), f"Roughness: {r:.3f}", fill=(200, 200, 255), font=font_small)
-                    y_offset += 20
-                    draw.text((w + 10, y_offset), f"Metallic: {m_val:.3f}", fill=(200, 200, 255), font=font_small)
-                    y_offset += 20
-                    draw.text((w + 10, y_offset), f"Specular: {s:.3f}", fill=(200, 200, 255), font=font_small)
+                    for line in lines:
+                        if y_offset + line_h > (h + h - 6):
+                            break
+                        color = (200, 200, 255)
+                        if line.startswith("Loss"):
+                            color = (255, 200, 200)
+                        draw.text((w + 10, y_offset), line, fill=color, font=font_small)
+                        y_offset += line_h
 
                     img_pil.save(str(progress_preview_path))
                 except Exception as e:
@@ -1749,6 +1920,12 @@ def main() -> int:
         "roughness": float(roughness.item()),
         "metallic": float(metallic.item()),
         "specular": float(specular.item()),
+        "specular_tint": float(specular_tint.item()),
+        "anisotropic": float(anisotropic.item()),
+        "sheen": float(sheen.item()),
+        "sheen_tint": float(sheen_tint.item()),
+        "clearcoat": float(clearcoat.item()),
+        "clearcoat_gloss": float(clearcoat_gloss.item()),
         "steps": args.steps,
         "lr": args.lr,
         "final_loss": float(loss.item()),
@@ -1764,6 +1941,12 @@ def main() -> int:
     print(f"  roughness: {roughness.item():.3f}")
     print(f"  metallic: {metallic.item():.3f}")
     print(f"  specular: {specular.item():.3f}")
+    print(f"  specular_tint: {specular_tint.item():.3f}")
+    print(f"  anisotropic: {anisotropic.item():.3f}")
+    print(f"  sheen: {sheen.item():.3f}")
+    print(f"  sheen_tint: {sheen_tint.item():.3f}")
+    print(f"  clearcoat: {clearcoat.item():.3f}")
+    print(f"  clearcoat_gloss: {clearcoat_gloss.item():.3f}")
     print(f"  final_loss: {loss.item():.6f}")
     print(f"\nWrote results to: {out_dir}")
 

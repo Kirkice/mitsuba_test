@@ -198,6 +198,55 @@ impl<T> DisneyParam<T> {
     }
 }
 
+fn bsdf_from_disney_material(dm: &DisneyMaterialConfig) -> BsdfNode {
+    BsdfNode {
+        plugin_type: "principled".to_string(),
+        params: vec![
+            BsdfParam {
+                name: "base_color".to_string(),
+                value: ParamValue::Rgb(dm.base_color.value),
+            },
+            BsdfParam {
+                name: "metallic".to_string(),
+                value: ParamValue::Float(dm.metallic.value),
+            },
+            BsdfParam {
+                name: "roughness".to_string(),
+                value: ParamValue::Float(dm.roughness.value),
+            },
+            BsdfParam {
+                name: "specular".to_string(),
+                value: ParamValue::Float(dm.specular.value),
+            },
+            BsdfParam {
+                name: "spec_tint".to_string(),
+                value: ParamValue::Float(dm.specular_tint.value),
+            },
+            BsdfParam {
+                name: "anisotropic".to_string(),
+                value: ParamValue::Float(dm.anisotropic.value),
+            },
+            BsdfParam {
+                name: "sheen".to_string(),
+                value: ParamValue::Float(dm.sheen.value),
+            },
+            BsdfParam {
+                name: "sheen_tint".to_string(),
+                value: ParamValue::Float(dm.sheen_tint.value),
+            },
+            BsdfParam {
+                name: "clearcoat".to_string(),
+                value: ParamValue::Float(dm.clearcoat.value),
+            },
+            BsdfParam {
+                name: "clearcoat_gloss".to_string(),
+                value: ParamValue::Float(dm.clearcoat_gloss.value),
+            },
+        ],
+        inner: None,
+    }
+}
+
 /// Disney Principled BRDF material configuration
 #[derive(Clone, Serialize, Deserialize)]
 struct DisneyMaterialConfig {
@@ -269,6 +318,10 @@ struct ObjectConfig {
     mesh_scale: f32,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CornellBoxConfig {
     camera: CameraConfig,
@@ -280,6 +333,8 @@ struct CornellBoxConfig {
     object: ObjectConfig,
     #[serde(default)]
     disney_material: DisneyMaterialConfig,
+    #[serde(default = "default_true")]
+    disney_auto_sync_pathtracing_bsdf: bool,
 }
 
 impl Default for CornellBoxConfig {
@@ -319,6 +374,7 @@ impl Default for CornellBoxConfig {
                 mesh_scale: 1.0,
             },
             disney_material: DisneyMaterialConfig::default(),
+            disney_auto_sync_pathtracing_bsdf: true,
         }
     }
 }
@@ -1139,8 +1195,12 @@ impl eframe::App for MitsubaStudioApp {
                         match self.main_tab {
                             MainTab::Training => self.load_preview_texture(ctx, false),
                             MainTab::PathTracing => self.load_pathtracing_texture(ctx, false),
+                            MainTab::SoftRender => self.load_softrender_texture(ctx, false),
                             _ => {}
                         }
+
+                        // Ensure the new texture is presented immediately.
+                        ctx.request_repaint();
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1678,16 +1738,46 @@ impl eframe::App for MitsubaStudioApp {
                                     egui::CollapsingHeader::new("Disney Material (Rasterization)")
                                         .default_open(false)
                                         .show(ui, |ui| {
+                                            let mut disney_changed = false;
+
                                             ui.label("These parameters are used for GPU rasterization-based training.");
                                             ui.label("Toggle 'Diff' to enable gradient optimization for each parameter.");
                                             ui.add_space(6.0);
 
+                                            ui.horizontal(|ui| {
+                                                let auto_changed = ui
+                                                    .checkbox(
+                                                        &mut self
+                                                            .config
+                                                            .disney_auto_sync_pathtracing_bsdf,
+                                                        "Auto-sync to Path Tracing BSDF",
+                                                    )
+                                                    .changed();
+                                                disney_changed |= auto_changed;
+                                                if auto_changed
+                                                    && self.config.disney_auto_sync_pathtracing_bsdf
+                                                {
+                                                    self.config.object.bsdf =
+                                                        bsdf_from_disney_material(
+                                                            &self.config.disney_material,
+                                                        );
+                                                    changed = true;
+                                                }
+
+                                                if ui.button("Copy to Path Tracing BSDF").clicked() {
+                                                    self.config.object.bsdf = bsdf_from_disney_material(&self.config.disney_material);
+                                                    changed = true;
+                                                }
+                                                ui.label(egui::RichText::new("Auto-sync overwrites 'Material (BSDF)' when Disney params change").weak());
+                                            });
+                                            ui.add_space(6.0);
+
                                             // Base Color
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.base_color.differentiable, "Diff")
                                                     .changed();
-                                                changed |= color3_ui(
+                                                disney_changed |= color3_ui(
                                                     ui,
                                                     "base_color",
                                                     &mut self.config.disney_material.base_color.value,
@@ -1697,10 +1787,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Metallic
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.metallic.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.metallic.value,
@@ -1713,10 +1803,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Roughness
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.roughness.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.roughness.value,
@@ -1729,10 +1819,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Specular
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.specular.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.specular.value,
@@ -1745,10 +1835,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Specular Tint
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.specular_tint.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.specular_tint.value,
@@ -1761,10 +1851,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Anisotropic
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.anisotropic.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.anisotropic.value,
@@ -1777,10 +1867,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Sheen
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.sheen.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.sheen.value,
@@ -1793,10 +1883,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Sheen Tint
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.sheen_tint.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.sheen_tint.value,
@@ -1809,10 +1899,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Clearcoat
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.clearcoat.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.clearcoat.value,
@@ -1825,10 +1915,10 @@ impl eframe::App for MitsubaStudioApp {
 
                                             // Clearcoat Gloss
                                             ui.horizontal(|ui| {
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .checkbox(&mut self.config.disney_material.clearcoat_gloss.differentiable, "Diff")
                                                     .changed();
-                                                changed |= ui
+                                                disney_changed |= ui
                                                     .add(
                                                         egui::Slider::new(
                                                             &mut self.config.disney_material.clearcoat_gloss.value,
@@ -1838,6 +1928,15 @@ impl eframe::App for MitsubaStudioApp {
                                                     )
                                                     .changed();
                                             });
+
+                                            if disney_changed
+                                                && self.config.disney_auto_sync_pathtracing_bsdf
+                                            {
+                                                self.config.object.bsdf = bsdf_from_disney_material(
+                                                    &self.config.disney_material,
+                                                );
+                                            }
+                                            changed |= disney_changed;
                                         });
                                 });
                         }
@@ -2849,7 +2948,15 @@ fn emit_bsdf_xml(out: &mut String, node: &BsdfNode, indent: usize) {
     ));
 
     for p in &node.params {
-        emit_param_xml(out, p, indent + 4);
+        // Compatibility: Mitsuba's principled BSDF uses `spec_tint` (not `specular_tint`).
+        // Keep accepting old saved configs and UI edits that may still use the Disney naming.
+        if node.plugin_type == "principled" && p.name.trim() == "specular_tint" {
+            let mut mapped = p.clone();
+            mapped.name = "spec_tint".to_string();
+            emit_param_xml(out, &mapped, indent + 4);
+        } else {
+            emit_param_xml(out, p, indent + 4);
+        }
     }
 
     if let Some(inner) = &node.inner {

@@ -19,9 +19,9 @@
         </film>
     </sensor>
 
-    <emitter type="envmap">
-        <string name="filename" value="textures/env.png"/>
-        <float name="scale" value="1"/>
+    <emitter type="directional">
+        <vector name="direction" x="-1" y="-1" z="-1"/>
+        <rgb name="irradiance" value="2.5, 2.5, 2.5"/>
     </emitter>
 
     <shape type="sphere">
@@ -29,8 +29,17 @@
         <transform name="to_world">
             <translate x="0" y="1.2" z="0"/>
         </transform>
-        <bsdf type="diffuse">
-            <rgb name="reflectance" value="1, 1, 1"/>
+        <bsdf type="principled">
+            <rgb name="base_color" value="1, 1, 1"/>
+            <float name="metallic" value="0"/>
+            <float name="roughness" value="0.65"/>
+            <float name="specular" value="0.47"/>
+            <float name="spec_tint" value="0"/>
+            <float name="anisotropic" value="0"/>
+            <float name="sheen" value="0"/>
+            <float name="sheen_tint" value="0"/>
+            <float name="clearcoat" value="0"/>
+            <float name="clearcoat_gloss" value="0"/>
         </bsdf>
     </shape>
 </scene>

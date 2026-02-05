@@ -1337,7 +1337,9 @@ def main() -> int:
         pred_np = pred.detach().cpu().numpy().astype(np.float32)
 
     # Save output
-    save_image_u8(out_path, np.clip(pred_np, 0.0, 1.0))
+    # Match the training GUI preview tone curve: apply a power(2.2) to the shading RGB.
+    # Note: save_image_u8 applies x ** (1/gamma). Setting gamma=1/2.2 results in x ** 2.2.
+    save_image_u8(out_path, np.clip(pred_np, 0.0, 1.0), gamma=(1.0 / 2.2))
 
     print(f"\nRender complete!")
     print(f"Saved to: {out_path}")
